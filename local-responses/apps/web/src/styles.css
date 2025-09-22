@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.badge { @apply inline-flex items-center rounded px-2 py-0.5 text-xs font-medium; }
+.badge-meta { @apply bg-blue-100 text-blue-800; }
+.badge-delta { @apply bg-green-100 text-green-800; }
+.badge-usage { @apply bg-purple-100 text-purple-800; }
+.badge-done { @apply bg-gray-200 text-gray-800; }
+.badge-ping { @apply bg-yellow-100 text-yellow-800; }
+.badge-error { @apply bg-red-100 text-red-800; }

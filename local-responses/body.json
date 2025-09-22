@@ -1,0 +1,7 @@
+﻿{
+    "input":  "Скажи привет одному предложению",
+    "max_output_tokens":  128,
+    "model":  "lm:qwen2.5-instruct",
+    "system":  "Ты лаконичный ассистент.",
+    "temperature":  0.3
+}
