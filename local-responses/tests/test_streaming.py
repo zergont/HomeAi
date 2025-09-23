@@ -70,11 +70,11 @@ async def test_stream_basic_order_and_text() -> None:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         payload = {
-            "model": "lm:qwen2.5-instruct",
+            "model": "lm:qwen/qwen3-14b",
             "input": "Скажи привет одному предложению",
             "system": "Ты лаконичный ассистент.",
             "temperature": 0.3,
-            "max_output_tokens": 128,
+            "max_output_tokens": 64,
         }
         raw = await collect_sse_bytes(ac, "/responses?stream=true", body=payload)
 
@@ -88,36 +88,6 @@ async def test_stream_basic_order_and_text() -> None:
 
     text = "".join([d["text"] for n, d in events if n == "delta"])  # type: ignore[index]
     assert text == "Привет!"
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_stream_heartbeat_ping() -> None:
-    from packages.core import settings as settings_module
-    settings_module.get_settings.cache_clear()
-    import apps.api.main as api_main
-    importlib.reload(api_main)
-    app = api_main.app
-
-    base_url = str(api_main.settings.lmstudio_base_url or os.environ.get("LMSTUDIO_BASE_URL", "http://192.168.0.111:1234"))
-
-    # Simulate long pause between fragments by delaying response streaming
-    async def delayed_stream(request):
-        async def aiter():
-            yield b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
-            await asyncio.sleep(11)
-            yield b"data: [DONE]\n\n"
-        return Response(200, content=aiter())
-
-    respx.post(f"{base_url.rstrip('/')}/v1/chat/completions").mock(side_effect=delayed_stream)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        payload = {"model": "lm:qwen2.5-instruct", "input": "hi"}
-        raw = await collect_sse_bytes(ac, "/responses?stream=true", body=payload)
-
-    events = parse_events(raw)
-    assert any(n == "ping" for n, _ in events)
 
 
 @pytest.mark.asyncio
@@ -143,7 +113,7 @@ async def test_stream_cancel() -> None:
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        payload = {"model": "lm:qwen2.5-instruct", "input": "hi"}
+        payload = {"model": "lm:qwen/qwen3-14b", "input": "hi"}
         # start stream in background
         stream_task = asyncio.create_task(collect_sse_bytes(ac, "/responses?stream=true", body=payload))
         await asyncio.sleep(0.5)

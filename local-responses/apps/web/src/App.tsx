@@ -4,8 +4,10 @@ import EventsConsole from './components/EventsConsole'
 import MessageView from './components/MessageView'
 import StatusIndicators from './components/StatusIndicators'
 import { getThreadMessages, postResponses, streamResponses, cancelResponse, type ThreadMessagesResponse } from './lib/api'
+import ProfilePage from './pages/Profile'
 
 export default function App() {
+  const [tab, setTab] = useState<'chat'|'profile'|'output'>('chat')
   const [model, setModel] = useState('')
   const [system, setSystem] = useState('')
   const [input, setInput] = useState('')
@@ -18,6 +20,7 @@ export default function App() {
   const [events, setEvents] = useState<{event:string; data:any; ts:string}[]>([])
   const [assistantText, setAssistantText] = useState('')
   const [history, setHistory] = useState<ThreadMessagesResponse|null>(null)
+  const [lastProviderRequest, setLastProviderRequest] = useState<any|null>(null)
   const currentRespId = useRef<string|null>(null)
   const abortCtrl = useRef<AbortController|null>(null)
   const threadIdRef = useRef<string|null>(null)
@@ -48,6 +51,8 @@ export default function App() {
       try {
         const res = await postResponses(body)
         if (res?.metadata?.thread_id) { setThreadId(res.metadata.thread_id); threadIdRef.current = res.metadata.thread_id }
+        // capture provider request from backend metadata
+        if (res?.metadata?.provider_request) setLastProviderRequest(res.metadata.provider_request)
         setAssistantText(res.output?.[0]?.content?.[0]?.text || '')
         if (res?.metadata?.summary) {
           // summary ready immediately
@@ -69,7 +74,11 @@ export default function App() {
     try {
       await streamResponses(body, (ev) => {
         setEvents(prev => [...prev, { event: ev.event, data: ev.data, ts: new Date().toLocaleTimeString() }])
-        if (ev.event === 'meta') { const id = ev.data?.metadata?.thread_id; if (id) { setThreadId(id); threadIdRef.current = id } currentRespId.current = ev.data.id }
+        if (ev.event === 'meta') {
+          const id = ev.data?.metadata?.thread_id; if (id) { setThreadId(id); threadIdRef.current = id } currentRespId.current = ev.data.id
+          // capture provider request for Output tab
+          if (ev.data?.metadata?.provider_request) setLastProviderRequest(ev.data.metadata.provider_request)
+        }
         if (ev.event === 'delta') setAssistantText(prev => prev + (ev.data?.text || ''))
         if (ev.event === 'summary') {
           setSummarizing(false)
@@ -113,61 +122,71 @@ export default function App() {
     }
   }
 
+  const copyLastProviderRequest = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(lastProviderRequest, null, 2))
+    } catch {}
+  }
+
   return (
     <div className="max-w-6xl mx-auto p-4 space-y-6">
       <div className="flex items-start justify-between">
         <h1 className="text-2xl font-bold">Local Responses Hub</h1>
+        <div className="flex gap-2">
+          <button className={`px-2 py-1 border rounded ${tab==='chat'?'bg-gray-200':''}`} onClick={()=>setTab('chat')}>Chat</button>
+          <button className={`px-2 py-1 border rounded ${tab==='profile'?'bg-gray-200':''}`} onClick={()=>setTab('profile')}>Profile</button>
+          <button className={`px-2 py-1 border rounded ${tab==='output'?'bg-gray-200':''}`} onClick={()=>setTab('output')}>Output</button>
+        </div>
         <StatusIndicators />
       </div>
-      <Controls
-        model={model} setModel={setModel}
-        system={system} setSystem={setSystem}
-        input={input} setInput={setInput}
-        temperature={temperature} setTemperature={setTemperature}
-        maxTokens={maxTokens} setMaxTokens={setMaxTokens}
-        createThread={createThread} setCreateThread={setCreateThread}
-        threadId={threadId}
-        stream={stream} setStream={setStream}
-        onSend={onSend} onCancel={onCancel} onClear={onClear}
-      />
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div>
-          <h2 className="font-semibold mb-2">События</h2>
-          <EventsConsole events={events} />
-        </div>
-        <div>
-          <h2 className="font-semibold mb-2">Ассистент</h2>
-          <div className="min-h-64 p-3 border rounded bg-white whitespace-pre-wrap">{assistantText}</div>
-        </div>
-      </div>
+      {tab === 'chat' ? (
+        <>
+          <Controls
+            model={model} setModel={setModel}
+            system={system} setSystem={setSystem}
+            input={input} setInput={setInput}
+            temperature={temperature} setTemperature={setTemperature}
+            maxTokens={maxTokens} setMaxTokens={setMaxTokens}
+            createThread={createThread} setCreateThread={setCreateThread}
+            threadId={threadId}
+            stream={stream} setStream={setStream}
+            onSend={onSend} onCancel={onCancel} onClear={onClear}
+          />
 
-      <div>
-        <div className="flex items-center gap-2 mb-2">
-          <h2 className="font-semibold">История треда</h2>
-          {summarizing && (
-            <span className="badge badge-ping">Summarizing… {summaryElapsed}s</span>
-          )}
-          <button className="px-2 py-1 border rounded disabled:opacity-50" disabled={!threadIdRef.current} onClick={()=>refreshHistory()}>Обновить</button>
-        </div>
-        {history?.context && (
-          <div className="p-3 mb-3 rounded border bg-blue-50">
-            <div className="text-xs text-gray-500 mb-1">Next system (summary) + budgeted messages</div>
-            <div className="text-sm"><span className="font-semibold">System:</span> <span className="whitespace-pre-wrap">{history.context.system}</span></div>
-            {history.context.messages?.length > 0 && (
-              <div className="mt-2">
-                <div className="text-xs text-gray-500">Messages in budget:</div>
-                <ul className="list-disc ml-5 text-sm">
-                  {history.context.messages.map((m, i) => (
-                    <li key={i}><span className="font-semibold">{m.role}:</span> <span className="whitespace-pre-wrap">{m.content}</span></li>
-                  ))}
-                </ul>
-              </div>
-            )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <h2 className="font-semibold mb-2">События</h2>
+              <EventsConsole events={events} />
+            </div>
+            <div>
+              <h2 className="font-semibold mb-2">Ассистент</h2>
+              <div className="min-h-64 p-3 border rounded bg-white whitespace-pre-wrap">{assistantText}</div>
+            </div>
           </div>
-        )}
-        <MessageView items={history?.messages || []} />
-      </div>
+
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <h2 className="font-semibold">История треда</h2>
+              {summarizing && (
+                <span className="badge badge-ping">Summarizing… {summaryElapsed}s</span>
+              )}
+              <button className="px-2 py-1 border rounded disabled:opacity-50" disabled={!threadIdRef.current} onClick={()=>refreshHistory()}>Обновить</button>
+            </div>
+            <MessageView items={history?.messages || []} />
+          </div>
+        </>
+      ) : tab === 'profile' ? (
+        <ProfilePage />
+      ) : (
+        <div>
+          <h2 className="font-semibold mb-2">Последний запрос бэка → LM Studio (JSON)</h2>
+          <div className="mb-2 flex items-center gap-2">
+            <button className="px-2 py-1 border rounded disabled:opacity-50" onClick={copyLastProviderRequest} disabled={!lastProviderRequest}>Копировать</button>
+          </div>
+          <pre className="p-3 border rounded bg-white overflow-auto whitespace-pre-wrap">{lastProviderRequest ? JSON.stringify(lastProviderRequest, null, 2) : 'Еще нет данных. Отправьте запрос.'}</pre>
+        </div>
+      )}
     </div>
   )
 }

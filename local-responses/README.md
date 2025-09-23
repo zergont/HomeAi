@@ -8,55 +8,35 @@ Endpoints
 - POST /responses (non-stream)
 - POST /responses?stream=true (SSE stream)
 - POST /responses/{id}/cancel
+- GET /profile
+- PUT /profile
+- GET /providers/lmstudio/context-length?model=<id>
+- GET /threads/{id}/memory
 
 SSE stream events
-- meta: { "id":"resp_<uuid>", "created": <unix>, "model": "...", "provider": {"name":"lmstudio","base_url":"..."}, "status":"in_progress" }
+- meta: { "id":"resp_<uuid>", "created": <unix>, "model": "...", "provider": {"name":"lmstudio","base_url":"..."}, "status":"in_progress", "metadata": { "thread_id": "...", "context_budget": { ... }, "context_assembly": { ... }, "memory": { ... } } }
+- meta.update: { "memory": { ... } }
 - delta: { "index": 0, "type": "output_text.delta", "text": "..." }
 - usage: { "input_tokens": N, "output_tokens": M, "total_tokens": N+M }
 - done: { "status": "completed" | "cancelled" }
 - ping: { "ts": "<UTC ISO8601>" }
 - error: { "message": "..." }
 
-Curl (Windows PowerShell)
-- $body = @{ model = "lm:qwen2.5-instruct"; input = "Скажи привет одному предложению"; system = "Ты лаконичный ассистент."; temperature = 0.3; max_output_tokens = 128 } | ConvertTo-Json -Depth 5
-- curl -N -H "Content-Type: application/json" -X POST --data $body http://127.0.0.1:8000/responses?stream=true
+Context Budget (P2/P2.1)
+- C_eff, R_out, R_sys, Safety, B_total_in, core_reserved, core_sys_pad, B_work
+- CTX_CORE_SYS_PAD_TOK — фиксированный запас ядра (100 по умолчанию), который прибавляется к core_cap при резервировании и уменьшает B_work
 
-JavaScript (EventSource)
-const es = new EventSource("http://127.0.0.1:8000/responses?stream=true", { withCredentials: false });
-es.addEventListener("meta", e => console.log("meta", JSON.parse(e.data)));
-es.addEventListener("delta", e => console.log("delta", JSON.parse(e.data)));
-es.addEventListener("usage", e => console.log("usage", JSON.parse(e.data)));
-es.addEventListener("done", e => console.log("done", JSON.parse(e.data)));
-es.addEventListener("ping", e => console.log("ping", JSON.parse(e.data)));
-es.onerror = (e) => { console.error("error", e); es.close(); };
+Context Assembly (P3)
+- Core/Profile → Tool Results → L3 → L2 → L1, строго в бюджетах
+- Контроль капов: core_cap (не ниже CONTEXT_MIN_CORE_SKELETON_TOK), tools_cap (доля от B_work), L1/L2/L3 — по compute_level_caps
+- Сжатия (squeeze) при нехватке: drop_l1 → drop_l2 → drop_tools → shrink_core
+- Метаданные context_assembly включают tokens/caps/budget/squeezes
 
-Cancel
-- Invoke-RestMethod -Method POST -Uri http://127.0.0.1:8000/responses/resp_<uuid>/cancel
+Memory L1/L2/L3 (P3)
+- L1 — пары user→assistant, капы по ролям (user≤120, assistant≤80)
+- L2 — пакетное сжатие L1 в тезисы; L3 — микротезисы из L2
+- Капы уровней рассчитываются из B_work, с учётом tool_results_tokens
+- Метаданные памяти в /responses.metadata.memory и в meta.update
 
-Threads and context
-- Provide `thread_id` in the request to continue a thread.
-- Or set `create_thread: true` to create a new thread automatically.
-- The response `metadata` includes `thread_id`.
-- Context budget is controlled by CTX_MAX_INPUT_TOKENS.
-- Auto-summary is triggered when total tokens exceed SUMMARY_TRIGGER_TOKENS.
-
-Examples
-Create thread on-the-fly
-{
-  "model": "lm:qwen2.5-instruct",
-  "input": "Привет!",
-  "create_thread": true
-}
-
-Continue thread
-{
-  "model": "lm:qwen2.5-instruct",
-  "input": "Продолжай.",
-  "thread_id": "<id>"
-}
-
-SSE (PowerShell)
-$body = @{ model = "lm:qwen2.5-instruct"; input = "Скажи привет"; create_thread = $true } | ConvertTo-Json -Depth 5
-curl.exe --% -N -H "Content-Type: application/json; charset=utf-8" -H "Accept: text/event-stream" --data-raw $body "http://127.0.0.1:8000/responses?stream=true"
-
-# Response
+Smoke
+curl "http://127.0.0.1:8000/threads/<id>/memory"

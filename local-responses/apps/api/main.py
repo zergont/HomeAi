@@ -1,4 +1,4 @@
-# apps/api/main.py
+# apps/api/main.py (config export + assemble_context integration + metrics)
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +6,7 @@ import json
 import os
 import time
 import logging
+import math
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -24,17 +25,38 @@ from packages.core.settings import get_settings
 from packages.core.logging import configure_logging, request_logging_middleware
 from packages.core.pricing import price_for
 from packages.providers.lmstudio import get_lmstudio_provider
-from packages.orchestration.redactor import redact_fragment
+from packages.providers.lmstudio_model_info import fetch_model_info
+from packages.orchestration.redactor import redact_fragment, safe_profile_output
 from packages.orchestration.context_manager import build_context
+from packages.orchestration.context_builder import assemble_context
 from packages.orchestration.summarizer import try_autosummarize
+from packages.orchestration.budget import compute_budgets
 from packages.storage.repo import (
     append_message,
     create_thread,
     fetch_context as repo_fetch_context,
     save_response,
     session_scope,
+    get_profile as repo_get_profile,
+    save_profile as repo_save_profile,
 )
 from packages.storage.models import Message, Thread
+from packages.utils.tokens import approx_tokens, profile_text_view
+from packages.orchestration.memory_manager import update_memory
+
+# Prometheus metrics (simple counters)
+try:
+    from prometheus_client import Counter
+    LR_CTX_OVERFLOW = Counter('lr_context_overflow_prevented_total', 'Context squeezes occurred')
+    LR_CTX_TOKENS = Counter('lr_context_tokens_total', 'Context tokens total by part', ['part'])
+    LR_CTX_SQUEEZES = Counter('lr_context_squeezes_total', 'Squeeze actions total', ['type'])
+except Exception:  # fallback dummies
+    class _Dummy:
+        def labels(self, *a, **k): return self
+        def inc(self, *a, **k): pass
+    LR_CTX_OVERFLOW = _Dummy()
+    LR_CTX_TOKENS = _Dummy()
+    LR_CTX_SQUEEZES = _Dummy()
 
 settings = get_settings()
 configure_logging(level=settings.log_level)
@@ -63,6 +85,103 @@ if web_dist.exists():
 
 # In-memory active streams registry
 ACTIVE_STREAMS: dict[str, dict[str, Any]] = {}
+
+
+class ProfileIn(BaseModel):
+    display_name: Optional[str] = None
+    preferred_language: Optional[str] = None
+    tone: Optional[str] = None
+    timezone: Optional[str] = None
+    region_coarse: Optional[str] = None
+    work_hours: Optional[str] = None
+    ui_format_prefs: Optional[Any] = None
+    goals_mood: Optional[str] = None
+    decisions_tasks: Optional[str] = None
+    brevity: Optional[str] = None
+    format_defaults: Optional[Any] = None
+    interests_topics: Optional[Any] = None
+    workflow_tools: Optional[Any] = None
+    os: Optional[str] = None
+    runtime: Optional[str] = None
+    hardware_hint: Optional[str] = None
+    source: Optional[str] = None
+    confidence: Optional[int] = None
+
+
+class ProfileOut(ProfileIn):
+    updated_at: Optional[str] = None
+    core_tokens: int
+    core_cap: int
+
+
+@app.get("/profile")
+async def get_profile() -> JSONResponse:
+    row = repo_get_profile()
+    # Build dict and normalize JSON-like fields
+    data: Dict[str, Any] = {
+        "display_name": row.display_name,
+        "preferred_language": row.preferred_language,
+        "tone": row.tone,
+        "timezone": row.timezone,
+        "region_coarse": row.region_coarse,
+        "work_hours": row.work_hours,
+        "ui_format_prefs": _maybe_json(row.ui_format_prefs),
+        "goals_mood": row.goals_mood,
+        "decisions_tasks": row.decisions_tasks,
+        "brevity": row.brevity,
+        "format_defaults": _maybe_json(row.format_defaults),
+        "interests_topics": _maybe_json(row.interests_topics),
+        "workflow_tools": _maybe_json(row.workflow_tools),
+        "os": row.os,
+        "runtime": row.runtime,
+        "hardware_hint": row.hardware_hint,
+        "source": row.source,
+        "confidence": row.confidence,
+        "updated_at": row.updated_at.isoformat() if getattr(row, 'updated_at', None) else None,
+    }
+    # Compute tokens
+    text = profile_text_view(data)
+    core_tokens = approx_tokens(text)
+    core_cap = int(math.ceil(core_tokens * 1.10))
+    data = safe_profile_output(data) | {"core_tokens": core_tokens, "core_cap": core_cap}
+    return JSONResponse(content=data)
+
+
+def _maybe_json(txt: Optional[str]) -> Any:
+    if not txt:
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        return txt
+
+
+def _json_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+@app.put("/profile")
+async def put_profile(payload: ProfileIn) -> JSONResponse:
+    # normalize values
+    data = payload.model_dump()
+    for k in ("ui_format_prefs", "format_defaults", "interests_topics", "workflow_tools"):
+        data[k] = _json_or_none(data.get(k))
+    # save
+    row = repo_save_profile(data)
+    # respond with normalized + tokens
+    out = {
+        **payload.model_dump(),
+        "updated_at": row.updated_at.isoformat() if getattr(row, 'updated_at', None) else None,
+    }
+    text = profile_text_view(out)
+    core_tokens = approx_tokens(text)
+    core_cap = int(math.ceil(core_tokens * 1.10))
+    out = safe_profile_output(out) | {"core_tokens": core_tokens, "core_cap": core_cap}
+    return JSONResponse(content=out)
 
 
 class ResponsesRequest(BaseModel):
@@ -109,6 +228,25 @@ async def health() -> Dict[str, Any]:
 @app.get("/config")
 async def config() -> JSONResponse:
     db_dialect = settings.db_dialect
+    # profile slice and tokens
+    prof_row = repo_get_profile()
+    prof_dict = {
+        "display_name": prof_row.display_name,
+        "preferred_language": prof_row.preferred_language,
+        "tone": prof_row.tone,
+        "timezone": prof_row.timezone,
+        "region_coarse": prof_row.region_coarse,
+        "work_hours": prof_row.work_hours,
+        "ui_format_prefs": _maybe_json(prof_row.ui_format_prefs),
+        "brevity": prof_row.brevity,
+        "os": prof_row.os,
+        "runtime": prof_row.runtime,
+        "hardware_hint": prof_row.hardware_hint,
+    }
+    prof_text = profile_text_view(prof_dict)
+    core_tokens = approx_tokens(prof_text)
+    core_cap = int(math.ceil(core_tokens * 1.10))
+
     safe_config = {
         "app_name": settings.app_name,
         "env": settings.app_env,
@@ -126,6 +264,11 @@ async def config() -> JSONResponse:
             "debounce_sec": settings.summary_debounce_sec,
             "default_model": settings.default_summary_model,
         },
+        "context": {
+            "CTX_CORE_SYS_PAD_TOK": settings.ctx_core_sys_pad_tok,
+            "CONTEXT_MIN_CORE_SKELETON_TOK": settings.context_min_core_skeleton_tok,
+        },
+        "profile": safe_profile_output(prof_dict) | {"core_tokens": core_tokens, "core_cap": core_cap},
     }
     return JSONResponse(content=safe_config)
 
@@ -177,114 +320,31 @@ async def lmstudio_models_v0() -> JSONResponse:
 
 @app.get("/providers/lmstudio/context-length")
 async def lmstudio_context_length(model: str) -> JSONResponse:
-    if not settings.lmstudio_base_url:
+    settings_local = settings
+    mid = model.split(":", 1)[1] if model.startswith("lm:") else model
+    info = await fetch_model_info(mid)
+    ttl = settings_local.ctx_model_info_ttl_sec
+    if info.get("source") == "default":
         return JSONResponse(status_code=200, content={
-            "model": model,
-            "context_length": None,
-            "source": None,
-            "state": None,
-            "max_context_length": None,
-            "error": "not configured",
+            "model": mid,
+            "context_length": settings_local.ctx_default_context_length,
+            "loaded_context_length": None,
+            "max_context_length": settings_local.ctx_default_context_length,
+            "source": "default",
+            "ttl_sec": ttl,
+            "state": info.get("state"),
+            "error": info.get("error"),
         })
-    # strip provider prefix if present
-    model_id = model.split(":", 1)[1] if model.startswith("lm:") else model
-
-    # Try proprietary LM Studio endpoint first
-    try:
-        url = f"{str(settings.lmstudio_base_url).rstrip('/')}/api/v0/models/{model_id}"
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            data = r.json()
-            return JSONResponse(content={
-                "model": model_id,
-                "context_length": data.get("loaded_context_length") if isinstance(data.get("loaded_context_length"), int) else None,
-                "source": "api/v0",
-                "state": data.get("state"),
-                "max_context_length": data.get("max_context_length"),
-            })
-    except httpx.HTTPError:
-        pass  # Fallback
-
-    # Fallback: Try Python SDK
-    parsed = urlparse(str(settings.lmstudio_base_url))
-    hostport = parsed.netloc or parsed.path
-
-    async def sdk_call() -> Optional[int]:
-        try:
-            import importlib
-
-            def _run() -> Optional[int]:
-                try:
-                    mod = importlib.import_module("lmstudio")
-                    LMStudioCls = getattr(mod, "LMStudio", None)
-                    if LMStudioCls is None:
-                        mod2 = importlib.import_module("lmstudio.client")
-                        LMStudioCls = getattr(mod2, "LMStudio", None)
-                    if LMStudioCls is None:
-                        return None
-                    client = LMStudioCls(host=hostport)
-                    mdl = client.get_model(model_id)
-                    if hasattr(mdl, "get_context_length"):
-                        return int(mdl.get_context_length())
-                    if hasattr(mdl, "getContextLength"):
-                        return int(mdl.getContextLength())
-                    return None
-                except Exception:
-                    return None
-
-            return await asyncio.to_thread(_run)
-        except Exception:
-            return None
-
-    ctx_len = await sdk_call()
-    if isinstance(ctx_len, int):
-        return JSONResponse(content={
-            "model": model_id,
-            "context_length": ctx_len,
-            "source": "sdk",
-            "state": None,
-            "max_context_length": None,
-        })
-
-    # Fallback: try OpenAI-compatible /v1/models for any hints
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(str(settings.lmstudio_base_url).rstrip("/") + "/v1/models")
-            r.raise_for_status()
-            data = r.json()
-            items = (data or {}).get("data") or []
-            found = next((m for m in items if (m or {}).get("id") == model_id), None)
-            if found:
-                params = found.get("params") or {}
-                for key in ("context_length", "max_context_length", "max_context_tokens"):
-                    if isinstance(found.get(key), int):
-                        return JSONResponse(content={
-                            "model": model_id,
-                            "context_length": int(found[key]),
-                            "source": "rest",
-                            "state": None,
-                            "max_context_length": None,
-                        })
-                    if isinstance(params.get(key), int):
-                        return JSONResponse(content={
-                            "model": model_id,
-                            "context_length": int(params[key]),
-                            "source": "rest",
-                            "state": None,
-                            "max_context_length": None,
-                        })
-    except httpx.HTTPError:
-        pass
-
-    # Never raise; return null so UI can show 'unknown'
-    return JSONResponse(status_code=200, content={
-        "model": model_id,
-        "context_length": None,
-        "source": None,
-        "state": None,
-        "max_context_length": None,
-        "error": "unavailable",
+    ctx_len = info.get("loaded_context_length") or info.get("max_context_length")
+    src = "lmstudio.loaded_context_length" if info.get("loaded_context_length") else "lmstudio.max_context_length"
+    return JSONResponse(content={
+        "model": mid,
+        "context_length": ctx_len,
+        "loaded_context_length": info.get("loaded_context_length"),
+        "max_context_length": info.get("max_context_length"),
+        "source": src,
+        "ttl_sec": ttl,
+        "state": info.get("state"),
     })
 
 
@@ -388,27 +448,76 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         raise HTTPException(status_code=503, detail="LM Studio base URL is not configured")
 
     provider = get_lmstudio_provider()
+    provider_info = {"name": "lmstudio", "base_url": str(settings.lmstudio_base_url)}
 
     # thread and context
     thread_id = _ensure_thread(req)
     ctx = build_context(thread_id)
-    system_text = req.system or ctx.get("system") or "You are a helpful assistant."
 
-    # Build full chat messages for provider memory
-    messages_for_provider = [
-        {"role": "system", "content": system_text},
-        *ctx.get("messages", []),
-        {"role": "user", "content": req.input},
-    ]
+    # Build assembled context respecting budgets and tools
+    assembled = await assemble_context(
+        thread_id=thread_id,
+        model_id=model,
+        max_output_tokens=req.max_output_tokens,
+        tool_results_text=None,
+        tool_results_tokens=0,
+        last_user_lang=None,
+    )
+    system_text = assembled["system_text"]
+    messages_for_provider = assembled["messages"]
 
-    # store user message immediately
-    append_message(thread_id, "user", redact_fragment(req.input))
-
-    provider_info = {"name": "lmstudio", "base_url": str(settings.lmstudio_base_url)}
     price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
 
     # Log resolved model id and base URL
     log_lm.info("lmstudio.request: model_id=%s base_url=%s stream=%s", provider_model, provider_info["base_url"], bool(stream))
+
+    # Profile core from repo
+    from packages.storage.repo import get_profile as _get_prof
+    prof = _get_prof()
+    prof_dict = {
+        "display_name": prof.display_name,
+        "preferred_language": prof.preferred_language,
+        "tone": prof.tone,
+        "timezone": prof.timezone,
+        "region_coarse": prof.region_coarse,
+        "work_hours": prof.work_hours,
+        "ui_format_prefs": _maybe_json(getattr(prof, 'ui_format_prefs', None)),
+        "goals_mood": prof.goals_mood,
+        "decisions_tasks": prof.decisions_tasks,
+        "brevity": prof.brevity,
+        "format_defaults": _maybe_json(getattr(prof, 'format_defaults', None)),
+        "interests_topics": _maybe_json(getattr(prof, 'interests_topics', None)),
+        "workflow_tools": _maybe_json(getattr(prof, 'workflow_tools', None)),
+        "os": prof.os,
+        "runtime": prof.runtime,
+        "hardware_hint": prof.hardware_hint,
+    }
+    core_text = profile_text_view(prof_dict)
+    core_tokens = approx_tokens(core_text)
+    core_cap = int(math.ceil(core_tokens * 1.10))
+
+    # Budgets for this request
+    budgets = await compute_budgets(model, req.max_output_tokens, core_tokens, core_cap, settings)
+    eff_max_out = min(req.max_output_tokens, budgets["R_out"]) if isinstance(req.max_output_tokens, int) else budgets["R_out"]
+    context_budget = budgets | {"effective_max_output_tokens": eff_max_out}
+
+    # Persist current user message in history so it appears in UI
+    try:
+        append_message(thread_id, "user", req.input)
+    except Exception:
+        pass
+
+    # Prepare provider request info (backend -> LM Studio)
+    provider_request = {
+        "url": f"{provider_info['base_url'].rstrip('/')}/v1/chat/completions",
+        "payload": {
+            "model": provider_model,
+            "messages": messages_for_provider,
+            "temperature": req.temperature,
+            "max_tokens": eff_max_out,
+            **({"stream": True} if stream else {}),
+        },
+    }
 
     if not stream:
         log_lm.info("lmstudio.generate start: model_id=%s", provider_model)
@@ -418,7 +527,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                 user=req.input,
                 model=provider_model,
                 temperature=req.temperature,
-                max_tokens=req.max_output_tokens,
+                max_tokens=eff_max_out,
                 messages=messages_for_provider,
             )
         except httpx.HTTPStatusError as e:
@@ -441,7 +550,18 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             raise HTTPException(status_code=502, detail=f"Failed to reach LM Studio: {e}")
         usage_vals = usage_dict or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
-        out_item = ResponsesOutputItem(content=[{"type": "output_text", "text": redact_fragment(text)}])
+        out_item = ResponsesOutputItem(content=[{"type": "output_text", "text": text}])
+        # metrics
+        stats = assembled.get("stats", {})
+        parts = stats.get("tokens", {})
+        for k in ("core","tools","l1","l2","l3"):
+            LR_CTX_TOKENS.labels(k).inc(parts.get(k, 0))
+        sq = stats.get("squeezes", [])
+        if sq:
+            LR_CTX_OVERFLOW.inc()
+            for sname in sq:
+                kind = sname.split(":",1)[0]
+                LR_CTX_SQUEEZES.labels(kind).inc()
         resp = ResponsesResponse(
             id=f"resp_{uuid4().hex}",
             created=int(time.time()),
@@ -450,9 +570,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             output=[out_item],
             usage=ResponsesUsage(**usage_vals),
             provider=provider_info,
-            metadata={"thread_id": thread_id} | (req.metadata or {}),
+            metadata={"thread_id": thread_id, "context_budget": context_budget, "context_assembly": stats, "provider_request": provider_request} | (req.metadata or {}),
         )
-        append_message(thread_id, "assistant", redact_fragment(text), tokens=usage_vals)
+        append_message(thread_id, "assistant", text, tokens=usage_vals)
         save_response(
             resp_id=resp.id,
             thread_id=thread_id,
@@ -465,6 +585,12 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             usage=usage_vals,
             cost=cost,
         )
+        try:
+            tool_results_tokens = 0
+            mem = await update_memory(thread_id, context_budget, tool_results_tokens, int(time.time()))
+            resp.metadata = (resp.metadata or {}) | {"memory": mem}
+        except Exception:
+            pass
         try:
             await try_autosummarize(thread_id, ctx.get("messages", []) + [{"role": "user", "content": req.input}, {"role": "assistant", "content": text}])
             summary_reason = "scheduled"  # computed inside; here just mark scheduled
@@ -515,7 +641,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             await queue.put(
                 await _sse_format(
                     "meta",
-                    {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id}},
+                    {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id, "context_budget": context_budget, "context_assembly": assembled.get("stats", {}), "provider_request": provider_request}},
                 )
             )
             try:
@@ -525,19 +651,31 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     user=req.input,
                     model=provider_model,
                     temperature=req.temperature,
-                    max_tokens=req.max_output_tokens,
+                    max_tokens=eff_max_out,
                     messages=messages_for_provider,
                 ):
                     if cancel_flag["cancelled"]:
                         break
                     last_delta_ts = time.monotonic()
-                    text = redact_fragment(frag)
+                    text = frag
                     collected.append(text)
                     await queue.put(
                         await _sse_format("delta", {"index": 0, "type": "output_text.delta", "text": text})
                     )
             except Exception as exc:  # noqa: BLE001
-                await queue.put(await _sse_format("error", {"message": str(exc)}))
+                # Map to friendly message and include provider request for UI troubleshooting
+                if isinstance(exc, httpx.RequestError):
+                    msg = f"Failed to reach LM Studio: {exc}"
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    try:
+                        status = exc.response.status_code if exc.response is not None else 0
+                        detail_text = exc.response.text if exc.response is not None else str(exc)
+                        msg = f"LM Studio error {status}: {detail_text}"
+                    except Exception:
+                        msg = str(exc)
+                else:
+                    msg = str(exc)
+                await queue.put(await _sse_format("error", {"message": msg, "provider_request": provider_request}))
                 done_event.set()
                 return
 
@@ -545,7 +683,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             usage_vals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
             # Persist assistant message and response and autosummarize
-            append_message(thread_id, "assistant", redact_fragment(final_text), tokens=usage_vals)
+            append_message(thread_id, "assistant", final_text, tokens=usage_vals)
             cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
             response_json = json.dumps(
                 {
@@ -576,17 +714,16 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                 cost=cost,
             )
             try:
-                await try_autosummarize(thread_id, ctx.get("messages", []) + [{"role": "user", "content": req.input}, {"role": "assistant", "content": final_text}])
-                scheduled = True
-                reason = "scheduled"
+                tool_results_tokens = 0
+                mem = await update_memory(thread_id, context_budget, tool_results_tokens, int(time.time()))
+                await queue.put(await _sse_format("meta.update", {"memory": mem}))
             except Exception:
-                scheduled = False
-                reason = "error"
+                pass
 
             # Send summary event immediately if exists
             with session_scope() as s:
                 t = s.get(Thread, thread_id)
-                meta = {"summary_scheduled": scheduled, "summary_reason": reason}
+                meta = {"summary_scheduled": False, "summary_reason": "stream"}
                 await queue.put(await _sse_format("meta.update", meta))
                 if t and t.summary:
                     await queue.put(

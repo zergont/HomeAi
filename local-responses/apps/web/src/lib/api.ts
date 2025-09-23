@@ -49,23 +49,16 @@ export async function getThreadMessages(threadId: string): Promise<ThreadMessage
   return res.json()
 }
 
-export type ContextInfo = {
-  model: string
-  context_length: number | null
-  source: string | null
-  state: 'loaded' | 'not-loaded' | string | null
-  max_context_length: number | null
-  error?: string
-}
-
-export async function getContextInfo(model: string): Promise<ContextInfo> {
+export async function getContextLength(model: string): Promise<number | null> {
   const res = await fetch(`${API_BASE}/providers/lmstudio/context-length?model=${encodeURIComponent(model)}`)
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  if (!res.ok) return null
+  const data = await res.json()
+  return typeof data?.context_length === 'number' ? data.context_length : null
 }
 
 export type ApiConfig = {
   providers?: { lmstudio?: { base_url?: string } }
+  profile?: any
 }
 
 export async function getConfig(): Promise<ApiConfig> {
@@ -74,18 +67,33 @@ export async function getConfig(): Promise<ApiConfig> {
   return res.json()
 }
 
-export type LMV0Model = {
-  id: string
-  type?: string
-  state?: 'loaded' | 'not-loaded' | string
-  max_context_length?: number
-  loaded_context_length?: number
+export type LMModelsResponse = { data?: Array<{ id: string; [k: string]: any }> }
+
+export async function getLMStudioModels(): Promise<LMModelsResponse> {
+  const res = await fetch(`${API_BASE}/providers/lmstudio/models`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
 }
 
-export type LMV0ModelsResponse = { data?: LMV0Model[] }
-
-export async function getLMStudioModelsV0(): Promise<LMV0ModelsResponse> {
+export type LMV0Model = { id: string; state?: string; [k: string]: any }
+export async function getLMStudioModelsV0(): Promise<{ data?: LMV0Model[] }> {
   const res = await fetch(`${API_BASE}/providers/lmstudio/models/v0`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export type ContextInfo = {
+  model: string
+  context_length: number | null
+  loaded_context_length?: number | null
+  max_context_length?: number | null
+  source?: string | null
+  ttl_sec?: number
+  state?: string | null
+  error?: string
+}
+export async function getContextInfo(model: string): Promise<ContextInfo> {
+  const res = await fetch(`${API_BASE}/providers/lmstudio/context-length?model=${encodeURIComponent(model)}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
@@ -100,4 +108,44 @@ export async function getLMStudioHealth(): Promise<{status: 'ok' | 'error'}> {
     const res = await fetch(`${API_BASE}/providers/lmstudio/health`)
     if (!res.ok) throw new Error('LM Studio health check failed')
     return res.json()
+}
+
+export type Profile = {
+  display_name?: string | null
+  preferred_language?: string | null
+  tone?: string | null
+  timezone?: string | null
+  region_coarse?: string | null
+  work_hours?: string | null
+  ui_format_prefs?: any
+  goals_mood?: string | null
+  decisions_tasks?: string | null
+  brevity?: string | null
+  format_defaults?: any
+  interests_topics?: any
+  workflow_tools?: any
+  os?: string | null
+  runtime?: string | null
+  hardware_hint?: string | null
+  source?: string | null
+  confidence?: number | null
+  updated_at?: string | null
+  core_tokens?: number
+  core_cap?: number
+}
+
+export async function getProfile(): Promise<Profile> {
+  const res = await fetch(`${API_BASE}/profile`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function putProfile(p: Profile): Promise<Profile> {
+  const res = await fetch(`${API_BASE}/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(p),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
 }
