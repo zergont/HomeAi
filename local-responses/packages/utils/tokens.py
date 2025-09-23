@@ -26,7 +26,7 @@ def profile_text_view(profile: Dict[str, Any]) -> str:
         return str(v)
 
     # Ordered sections
-    add(f"Name: {norm(profile.get('display_name'))}")
+    add(f"User Name: {norm(profile.get('display_name'))}")
     add(f"Language: {norm(profile.get('preferred_language'))}")
     add(f"Tone: {norm(profile.get('tone'))}")
     add(f"Timezone: {norm(profile.get('timezone'))}")

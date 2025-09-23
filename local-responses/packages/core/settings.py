@@ -66,6 +66,16 @@ class AppSettings(BaseSettings):
     price_per_1k_default: float = Field(default=0.0, validation_alias="PRICE_PER_1K_DEFAULT")
     price_overrides: Dict[str, float] = Field(default_factory=dict)
 
+    # Tool runs settings
+    TOOL_RUNS_CACHE_TTL_SEC: int = 86400  # сутки
+    TOOL_ARGS_HASH_ALGO: str = "sha256"
+
+    # Retry settings
+    RETRY_ON_LENGTH_ENABLED: bool = True
+    RETRY_ON_LENGTH_MAX: int = 1
+    RETRY_PART_MAX_TOK: int = 1500
+    RETRY_THINK_MAX_PCT: float = 0.10
+
     @property
     def db_dialect(self) -> str:
         # Extract dialect part from SQLAlchemy URL (e.g., sqlite)

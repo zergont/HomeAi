@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from packages.core.settings import get_settings
-from packages.storage.models import Base, Message, Response, Thread, Profile, MemoryState, L2Summary, L3MicroSummary
+from packages.storage.models import Base, Message, Response, Thread, Profile, MemoryState, L2Summary, L3MicroSummary, ToolRun
 from packages.utils.tokens import approx_tokens
 from packages.orchestration.redactor import redact_fragment
 
@@ -76,7 +76,12 @@ def append_message(
     role: str,
     content: str,
     tokens: Optional[Dict[str, int]] = None,
+    finish_reason: Optional[str] = None,
+    attempt: Optional[int] = None,
 ) -> Message:
+    # Не сохранять первую попытку assistant-ответа при finish_reason:'length' (ретрай)
+    if role == "assistant" and finish_reason == "length" and (attempt is None or attempt == 1):
+        return None
     mid = uuid.uuid4().hex
     msg = Message(
         id=mid,
@@ -285,3 +290,23 @@ def get_latest_l2(thread_id: str, limit: int = 20) -> List[L2Summary]:
 def get_latest_l3(thread_id: str, limit: int = 20) -> List[L3MicroSummary]:
     with session_scope() as s:
         return list(s.query(L3MicroSummary).filter(L3MicroSummary.thread_id == thread_id).order_by(L3MicroSummary.id.desc()).limit(limit))
+
+def get_tool_run(thread_id: str, tool_name: str, args_hash: str):
+    with session_scope() as s:
+        return s.query(ToolRun).filter_by(thread_id=thread_id, tool_name=tool_name, args_hash=args_hash).first()
+
+def insert_tool_run(thread_id: str, attempt_id: str, tool_name: str, args_json: str, args_hash: str, result_text: str, status: str, created_at: int):
+    with session_scope() as s:
+        run = ToolRun(
+            thread_id=thread_id,
+            attempt_id=attempt_id,
+            tool_name=tool_name,
+            args_json=args_json,
+            args_hash=args_hash,
+            result_text=result_text,
+            status=status,
+            created_at=created_at,
+        )
+        s.add(run)
+        s.commit()
+        return run

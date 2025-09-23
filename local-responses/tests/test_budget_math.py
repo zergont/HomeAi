@@ -4,6 +4,7 @@ import math
 import pytest
 from packages.orchestration.budget import compute_budgets
 from packages.core.settings import get_settings
+from packages.storage.models import ToolRun
 
 class DummySettings:
     ctx_model_info_ttl_sec = 300

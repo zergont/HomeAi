@@ -1,4 +1,4 @@
-import React, { useMemo, useState, ReactNode } from 'react'
+import React, { useMemo, useState, useEffect, ReactNode } from 'react'
 
 type Ev = { event: string; data: any; ts: string }
 
@@ -12,10 +12,26 @@ const Section = ({ title, children }: { title: string; children: ReactNode }) =>
 export default function EventsConsole({ events }: { events: Ev[] }) {
   const [showDeltas, setShowDeltas] = useState(false)
   const [showRaw, setShowRaw] = useState(false)
+  const [resetBadge, setResetBadge] = useState(false)
 
+  useEffect(() => {
+    const lastMeta = events[events.length - 1]?.data?.reset
+    if (lastMeta) {
+      setResetBadge(true)
+      setTimeout(() => setResetBadge(false), 4000)
+    }
+  }, [events])
+
+  // Find the last event that actually carries metadata with context fields
   const lastMeta = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].event === 'meta' || events[i].event === 'done') return events[i]
+      const e = events[i]
+      const md = e?.data?.metadata
+      if (md && (md.context_budget || md.context_assembly)) return e
+    }
+    // fallback: try last 'meta'
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].event === 'meta') return events[i]
     }
     return null
   }, [events])
@@ -126,8 +142,15 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
     }
   }
 
+  const freeOutCap = ctxAsm?.free_out_cap
+
   return (
     <div className="space-y-2">
+      {resetBadge && (
+        <div className="bg-yellow-100 border border-yellow-400 text-yellow-800 px-4 py-2 rounded mb-2">
+          Retry due to length... (ответ был обрезан, повторная попытка)
+        </div>
+      )}
       <div className="flex items-center gap-4 text-xs">
         <label className="flex items-center gap-1 cursor-pointer">
           <input type="checkbox" checked={showDeltas} onChange={e => setShowDeltas(e.target.checked)} />
@@ -152,7 +175,12 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
               <div className="text-gray-600">context_budget</div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-1">
                 {(Object.entries(ctxBudget) as [string, any][]).map(([k, v]) => (
-                  <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
+                  <div key={k} className="rounded bg-gray-50 px-2 py-1">
+                    <span className="text-gray-500">{k}</span>: {String(v)}
+                    {k === 'effective_max_output_tokens' && typeof freeOutCap === 'number' && (
+                      <span className="ml-2 text-gray-600">(free_out_cap: {freeOutCap})</span>
+                    )}
+                  </div>
                 ))}
               </div>
             </div>
@@ -198,6 +226,15 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                 </div>
               )}
             </div>
+          )}
+          {lastMeta?.data?.metadata?.retry && (
+            <div className="mt-2 text-blue-700">Retry: {JSON.stringify(lastMeta.data.metadata.retry)}</div>
+          )}
+          {ctxAsm?.think_truncated && (
+            <div className="mt-1 text-orange-700">think_truncated: {String(ctxAsm.think_truncated)}</div>
+          )}
+          {lastMeta?.data?.metadata?.tool_runs_first_attempt !== undefined && (
+            <div className="mt-1 text-green-700">tool_runs_first_attempt: {String(lastMeta.data.metadata.tool_runs_first_attempt)}</div>
           )}
         </div>
       )}

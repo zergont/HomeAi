@@ -149,3 +149,17 @@ class L3MicroSummary(Base):
     text = Column(Text, nullable=False)
     tokens = Column(Integer, nullable=False)
     created_at = Column(Integer, nullable=False, default=lambda: int(datetime.utcnow().timestamp()))
+
+
+class ToolRun(Base):
+    __tablename__ = "tool_runs"
+
+    id = Column(Integer, primary_key=True)
+    thread_id = Column(String, index=True, nullable=False)
+    attempt_id = Column(String, nullable=False)  # uuid попытки
+    tool_name = Column(String, index=True, nullable=False)
+    args_json = Column(Text, nullable=False)
+    args_hash = Column(String, index=True, nullable=False)  # sha256 канонизированных аргументов
+    result_text = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="done")  # done|error
+    created_at = Column(Integer, nullable=False)

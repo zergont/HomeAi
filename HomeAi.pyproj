@@ -26,6 +26,7 @@
     <Compile Include="HomeAi.py" />
     <Compile Include="local-responses\alembic\env.py" />
     <Compile Include="local-responses\alembic\versions\0001_initial.py" />
+    <Compile Include="local-responses\alembic\versions\20240611_tool_runs.py" />
     <Compile Include="local-responses\alembic\versions\20250919_000001_m1p3_init.py" />
     <Compile Include="local-responses\alembic\versions\20250921_000002_summary_meta.py" />
     <Compile Include="local-responses\alembic\versions\20250922_000003_profile_init.py" />
@@ -42,7 +43,10 @@
     <Compile Include="local-responses\packages\orchestration\context_manager.py" />
     <Compile Include="local-responses\packages\orchestration\memory_manager.py" />
     <Compile Include="local-responses\packages\orchestration\redactor.py" />
+    <Compile Include="local-responses\packages\orchestration\retry_policy.py" />
+    <Compile Include="local-responses\packages\orchestration\stream_handlers.py" />
     <Compile Include="local-responses\packages\orchestration\summarizer.py" />
+    <Compile Include="local-responses\packages\orchestration\tool_runtime.py" />
     <Compile Include="local-responses\packages\providers\base.py" />
     <Compile Include="local-responses\packages\providers\lmstudio.py" />
     <Compile Include="local-responses\packages\providers\lmstudio\cache.py" />
@@ -55,6 +59,7 @@
     <Compile Include="local-responses\packages\storage\__init__.py" />
     <Compile Include="local-responses\packages\utils\i18n.py" />
     <Compile Include="local-responses\packages\utils\tokens.py" />
+    <Compile Include="local-responses\packages\utils\tools.py" />
     <Compile Include="local-responses\tests\test_autosummary.py" />
     <Compile Include="local-responses\tests\test_budget_math.py" />
     <Compile Include="local-responses\tests\test_config.py" />
