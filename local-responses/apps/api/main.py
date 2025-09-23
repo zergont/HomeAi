@@ -454,7 +454,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     thread_id = _ensure_thread(req)
     ctx = build_context(thread_id)
 
-    # Build assembled context respecting budgets and tools
+    # Build assembled context respecting budgets and tools (include current user for dry token count)
     assembled = await assemble_context(
         thread_id=thread_id,
         model_id=model,
@@ -462,44 +462,23 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         tool_results_text=None,
         tool_results_tokens=0,
         last_user_lang=None,
+        current_user_text=req.input,
     )
     system_text = assembled["system_text"]
-    messages_for_provider = assembled["messages"]
+    messages_for_provider = ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
 
     price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
 
     # Log resolved model id and base URL
     log_lm.info("lmstudio.request: model_id=%s base_url=%s stream=%s", provider_model, provider_info["base_url"], bool(stream))
 
-    # Profile core from repo
-    from packages.storage.repo import get_profile as _get_prof
-    prof = _get_prof()
-    prof_dict = {
-        "display_name": prof.display_name,
-        "preferred_language": prof.preferred_language,
-        "tone": prof.tone,
-        "timezone": prof.timezone,
-        "region_coarse": prof.region_coarse,
-        "work_hours": prof.work_hours,
-        "ui_format_prefs": _maybe_json(getattr(prof, 'ui_format_prefs', None)),
-        "goals_mood": prof.goals_mood,
-        "decisions_tasks": prof.decisions_tasks,
-        "brevity": prof.brevity,
-        "format_defaults": _maybe_json(getattr(prof, 'format_defaults', None)),
-        "interests_topics": _maybe_json(getattr(prof, 'interests_topics', None)),
-        "workflow_tools": _maybe_json(getattr(prof, 'workflow_tools', None)),
-        "os": prof.os,
-        "runtime": prof.runtime,
-        "hardware_hint": prof.hardware_hint,
+    # unified metadata
+    eff_max_out = int(assembled["context_budget"]["effective_max_output_tokens"]) if assembled.get("context_budget") else req.max_output_tokens
+    meta_common = {
+        "thread_id": thread_id,
+        "context_budget": assembled.get("context_budget"),
+        "context_assembly": assembled.get("stats", {}),
     }
-    core_text = profile_text_view(prof_dict)
-    core_tokens = approx_tokens(core_text)
-    core_cap = int(math.ceil(core_tokens * 1.10))
-
-    # Budgets for this request
-    budgets = await compute_budgets(model, req.max_output_tokens, core_tokens, core_cap, settings)
-    eff_max_out = min(req.max_output_tokens, budgets["R_out"]) if isinstance(req.max_output_tokens, int) else budgets["R_out"]
-    context_budget = budgets | {"effective_max_output_tokens": eff_max_out}
 
     # Persist current user message in history so it appears in UI
     try:
@@ -523,8 +502,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         log_lm.info("lmstudio.generate start: model_id=%s", provider_model)
         try:
             text, usage_dict = await provider.generate(
-                system=system_text,
-                user=req.input,
+                system=None,
+                user="",
                 model=provider_model,
                 temperature=req.temperature,
                 max_tokens=eff_max_out,
@@ -570,7 +549,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             output=[out_item],
             usage=ResponsesUsage(**usage_vals),
             provider=provider_info,
-            metadata={"thread_id": thread_id, "context_budget": context_budget, "context_assembly": stats, "provider_request": provider_request} | (req.metadata or {}),
+            metadata=meta_common | {"provider_request": provider_request} | (req.metadata or {}),
         )
         append_message(thread_id, "assistant", text, tokens=usage_vals)
         save_response(
@@ -587,7 +566,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         )
         try:
             tool_results_tokens = 0
-            mem = await update_memory(thread_id, context_budget, tool_results_tokens, int(time.time()))
+            mem = await update_memory(thread_id, assembled.get("context_budget", {}), tool_results_tokens, int(time.time()))
             resp.metadata = (resp.metadata or {}) | {"memory": mem}
         except Exception:
             pass
@@ -641,14 +620,14 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             await queue.put(
                 await _sse_format(
                     "meta",
-                    {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id, "context_budget": context_budget, "context_assembly": assembled.get("stats", {}), "provider_request": provider_request}},
+                    {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": meta_common | {"provider_request": provider_request}},
                 )
             )
             try:
                 log_lm.info("lmstudio.agenerate_stream start: model_id=%s", provider_model)
                 async for frag in provider.agenerate_stream(
-                    system=system_text,
-                    user=req.input,
+                    system=None,
+                    user="",
                     model=provider_model,
                     temperature=req.temperature,
                     max_tokens=eff_max_out,
@@ -715,7 +694,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             )
             try:
                 tool_results_tokens = 0
-                mem = await update_memory(thread_id, context_budget, tool_results_tokens, int(time.time()))
+                mem = await update_memory(thread_id, assembled.get("context_budget", {}), tool_results_tokens, int(time.time()))
                 await queue.put(await _sse_format("meta.update", {"memory": mem}))
             except Exception:
                 pass

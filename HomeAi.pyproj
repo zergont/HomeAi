@@ -53,6 +53,7 @@
     <Compile Include="local-responses\packages\storage\models.py" />
     <Compile Include="local-responses\packages\storage\repo.py" />
     <Compile Include="local-responses\packages\storage\__init__.py" />
+    <Compile Include="local-responses\packages\utils\i18n.py" />
     <Compile Include="local-responses\packages\utils\tokens.py" />
     <Compile Include="local-responses\tests\test_autosummary.py" />
     <Compile Include="local-responses\tests\test_budget_math.py" />
@@ -62,6 +63,7 @@
     <Compile Include="local-responses\tests\test_context_core_cap.py" />
     <Compile Include="local-responses\tests\test_context_lang_follow.py" />
     <Compile Include="local-responses\tests\test_cost_usage.py" />
+    <Compile Include="local-responses\tests\test_current_user_protection.py" />
     <Compile Include="local-responses\tests\test_health.py" />
     <Compile Include="local-responses\tests\test_memory_in_responses.py" />
     <Compile Include="local-responses\tests\test_memory_levels.py" />

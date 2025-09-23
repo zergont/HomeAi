@@ -15,8 +15,11 @@ async def test_lang_follow_ru(monkeypatch):
     import packages.orchestration.context_builder as cb
     monkeypatch.setattr(cb, 'compute_budgets', fake_budgets)
 
-    out = await assemble_context('thread_dummy', 'lm:qwen/qwen3-14b', max_output_tokens=None, tool_results_text=None, tool_results_tokens=None, last_user_lang='ru')
-    assert 'Инструкции' in out['system_text']
+    out = await assemble_context(thread_id='thread_dummy', model_id='lm:qwen/qwen3-14b', max_output_tokens=None, tool_results_text=None, tool_results_tokens=None, last_user_lang='ru')
+    text = out['system_text']
+    assert 'Следуй правилам' in text
+    assert 'ПРОФИЛЬ (ЯДРО)' in text
+    assert '---' in text
 
 @pytest.mark.asyncio
 async def test_lang_follow_en(monkeypatch):
@@ -29,5 +32,8 @@ async def test_lang_follow_en(monkeypatch):
     import packages.orchestration.context_builder as cb
     monkeypatch.setattr(cb, 'compute_budgets', fake_budgets)
 
-    out = await assemble_context('thread_dummy', 'lm:qwen/qwen3-14b', max_output_tokens=None, tool_results_text=None, tool_results_tokens=None, last_user_lang='en')
-    assert 'Instructions' in out['system_text']
+    out = await assemble_context(thread_id='thread_dummy', model_id='lm:qwen/qwen3-14b', max_output_tokens=None, tool_results_text=None, tool_results_tokens=None, last_user_lang='en')
+    text = out['system_text']
+    assert 'Follow the rules' in text
+    assert 'CORE PROFILE' in text
+    assert '---' in text
