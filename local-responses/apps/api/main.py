@@ -1,4 +1,5 @@
-# apps/api/main.py (config export + assemble_context integration + metrics)
+# apps/api/main.py (only relevant diffs applied earlier)
+
 from __future__ import annotations
 
 import asyncio

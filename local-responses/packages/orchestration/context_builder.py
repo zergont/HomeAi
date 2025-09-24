@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math, time
+import math, time, logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from packages.core.settings import get_settings
@@ -11,6 +11,8 @@ from packages.storage.models import L2Summary, L3MicroSummary, Message
 from packages.utils.tokens import approx_tokens, profile_text_view
 from packages.utils.i18n import pick_lang, t
 from packages.providers import lmstudio_tokens
+
+logger = logging.getLogger("app.context")
 
 
 def _cap_text_by_tokens(txt: str, cap: int) -> str:
@@ -34,23 +36,26 @@ def _condense_assistant(text: str, lang_ru: bool) -> str:
     return (first if not numbers else f"{first}\n{'Ключевые числа/параметры' if lang_ru else 'Key numbers/params'}: {numbers}")
 
 
-def _pairs_with_ids(msgs: List[Message]) -> Tuple[List[Tuple[str,str]], List[Tuple[str,str]]]:
-    # returns (pairs_ids, pairs_texts) in chronological order
-    pairs_ids: List[Tuple[str,str]] = []
-    pairs_txt: List[Tuple[str,str]] = []
+def build_pairs(msgs: List[Message]) -> List[Tuple[Message, Message]]:
+    """Build user→assistant pairs in chronological order (ASC). Only valid u→a pairs."""
+    pairs: List[Tuple[Message, Message]] = []
     i = 0
     while i < len(msgs) - 1:
-        if msgs[i].role == 'user' and msgs[i+1].role == 'assistant':
-            uid = msgs[i].id
-            aid = msgs[i+1].id
-            u = sanitize_for_memory(msgs[i].content or '')
-            a = sanitize_for_memory(msgs[i+1].content or '')
-            pairs_ids.append((uid, aid))
-            pairs_txt.append((u, a))
+        u, a = msgs[i], msgs[i + 1]
+        if u.role == 'user' and a.role == 'assistant':
+            pairs.append((u, a))
             i += 2
         else:
             i += 1
-    return pairs_ids, pairs_txt
+    return pairs
+
+
+def _flatten_tail_pairs(tail_pairs: List[Tuple[Message, Message]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for (u, a) in tail_pairs:
+        out.append({'role': 'user', 'content': sanitize_for_memory(u.content or '')})
+        out.append({'role': 'assistant', 'content': sanitize_for_memory(a.content or '')})
+    return out
 
 
 async def assemble_context(
@@ -64,6 +69,7 @@ async def assemble_context(
 ) -> Dict[str, Any]:
     st = get_settings()
 
+    # Profile & language
     prof = get_profile()
     lang = pick_lang(last_user_lang, prof.preferred_language)
 
@@ -104,7 +110,7 @@ async def assemble_context(
     L2_cap = int(math.floor(st.mem_l2_share * work_left))
     L3_cap = int(math.floor(st.mem_l3_share * work_left))
 
-    # L3 newest first
+    # L3 newest first from DB
     l3_txt = ''
     with session_scope() as s:
         l3_items = list(s.query(L3MicroSummary).filter(L3MicroSummary.thread_id == thread_id).order_by(L3MicroSummary.id.desc()))
@@ -117,7 +123,7 @@ async def assemble_context(
             acc.append(b)
         l3_txt = "\n".join(acc)
 
-    # L2 newest first
+    # L2 newest first from DB
     l2_txt = ''
     with session_scope() as s:
         l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
@@ -130,23 +136,24 @@ async def assemble_context(
             acc2.append(b)
         l2_txt = "\n".join(acc2)
 
-    # Build pairs and tail
-    from packages.storage.repo import get_messages_since, get_or_create_memory_state, ensure_l2_for_pairs, promote_l2_to_l3
-    state = get_or_create_memory_state(thread_id)
-    msgs = get_messages_since(thread_id, state.last_compacted_message_id)
-    pairs_ids_all, pairs_all = _pairs_with_ids(msgs)
-    tail_N = int(getattr(st, 'L1_TAIL_UNCLIPPED_PAIRS', 4))
-    tail_pairs = pairs_all[-tail_N:] if tail_N > 0 else []
-    tail_pairs_ids = pairs_ids_all[-tail_N:] if tail_N > 0 else []
-    senior_pairs = pairs_all[:-tail_N] if tail_N > 0 else pairs_all
-    senior_pairs_ids = pairs_ids_all[:-tail_N] if tail_N > 0 else []
+    # Build full message history ASC (user/assistant only)
+    with session_scope() as s:
+        history_msgs = [m for m in s.query(Message).filter(Message.thread_id == thread_id).order_by(Message.created_at.asc()) if m.role in ("user","assistant")]
+    pairs_all = build_pairs(history_msgs)
+    tail_n = min(int(getattr(st, 'L1_TAIL_UNCLIPPED_PAIRS', 4)), len(pairs_all))
+    tail_pairs = pairs_all[-tail_n:]
+    old_pairs = pairs_all[:-tail_n]
 
-    # Compose L1 messages from tail (chronological)
-    l1_msgs_out: List[Dict[str, str]] = []
-    for (u, a) in tail_pairs:
-        l1_msgs_out.extend(({'role': 'user', 'content': u}, {'role': 'assistant', 'content': a}))
+    # DEBUG logs
+    logger.debug("L1.build: total_pairs=%d, tail_pairs=%d, old_pairs=%d", len(pairs_all), len(tail_pairs), len(old_pairs))
+    def _short(mid: str) -> str:
+        return (mid or '')[-6:]
+    logger.debug("L1.tail.ids: %s", [f"u#{_short(u.id)}->a#{_short(a.id)}" for (u,a) in tail_pairs])
 
-    # Build system
+    # Compose L1 from tail only (ASC)
+    l1_msgs_out: List[Dict[str, str]] = _flatten_tail_pairs(tail_pairs)
+
+    # Build system and tokens
     D = t(lang, 'divider')
     def build_system(core_text: str, tools_text: str, l3_text: str, l2_text: str) -> str:
         blocks: List[str] = [t(lang, 'instruction'), D, t(lang, 'core_profile'), core_text]
@@ -172,8 +179,6 @@ async def assemble_context(
         return {'core_tok': core_tok, 'tools_tok': tools_tok, 'l3_tok': l3_tok, 'l2_tok': l2_tok, 'l1_tok': l1_tok, 'current_user_tokens': current_user_tokens, 'total_in': total_in}
 
     def preflight_and_adjust(messages_for_provider: List[Dict[str,str]]) -> Optional[int]:
-        if getattr(st, 'TOKEN_COUNT_MODE', 'proxy') != 'proxy':
-            return None
         try:
             mid = model_id.split(":", 1)[1] if model_id.startswith("lm:") else model_id
             n = lmstudio_tokens.count_tokens_chat(mid, messages_for_provider, getattr(st, 'TOKEN_CACHE_TTL_SEC', 300))
@@ -204,35 +209,39 @@ async def assemble_context(
     summary_created_l3 = 0
     now_ts = int(time.time())
 
-    max_cycles = 10
+    # Helpers to call repo ops
+    from packages.storage.repo import ensure_l2_for_pairs as repo_ensure_l2, promote_l2_to_l3 as repo_promote_l2
+
+    max_cycles = 15
     while overflows(toks['total_in']) and max_cycles > 0:
         max_cycles -= 1
-        # 1) Ensure L2 for senior pairs, then drop them from L1 (they already are not in L1; we only generate L2)
-        if senior_pairs_ids:
-            created = ensure_l2_for_pairs(thread_id, senior_pairs_ids, lang, now_ts)
+        # 1) Ensure L2 for old_pairs (do not touch tail)
+        if old_pairs:
+            ids = [(u.id, a.id) for (u, a) in old_pairs]
+            created = repo_ensure_l2(thread_id, ids, lang, now_ts)
             if created:
                 summary_created_l2 += created
                 compaction_steps.append(f"l1_to_l2:{created}")
-            senior_pairs_ids = []
-            # refresh l2_txt from DB
+            # refresh L2 view
             with session_scope() as s:
                 l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
             l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db])
+            old_pairs = []
             rebuild()
             prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
             if not overflows(toks['total_in']):
                 break
             continue
-        # 2) Promote oldest L2 to L3 (batch oldest few)
+        # 2) Promote L2 -> L3 (oldest first)
         with session_scope() as s:
-            l2_old = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.asc()))
-        if l2_old:
-            ids = [x.id for x in l2_old[:5]]
-            made = promote_l2_to_l3(thread_id, ids, lang, now_ts)
+            l2_oldest = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.asc()))
+        if l2_oldest:
+            ids2 = [x.id for x in l2_oldest[:5]]
+            made = repo_promote_l2(thread_id, ids2, lang, now_ts)
             if made:
                 summary_created_l3 += made
-                compaction_steps.append(f"l2_to_l3:{len(ids)}")
-            # refresh l2/l3 views
+                compaction_steps.append(f"l2_to_l3:{len(ids2)}")
+            # refresh L2/L3 views
             with session_scope() as s:
                 l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
                 l3_items = list(s.query(L3MicroSummary).filter(L3MicroSummary.thread_id == thread_id).order_by(L3MicroSummary.id.desc()))
@@ -243,24 +252,20 @@ async def assemble_context(
             if not overflows(toks['total_in']):
                 break
             continue
-        # 3) Reduce L1 tail to fallback and ensure L2 for removed
+        # 3) Reduce tail to fallback (move removed pairs to L2)
         fallback = int(getattr(st, 'L1_TAIL_FALLBACK_PAIRS', 2))
-        if len(tail_pairs_ids) > fallback:
-            keep_ids = tail_pairs_ids[-fallback:]
-            removed_ids = tail_pairs_ids[:-fallback]
-            if removed_ids:
-                created2 = ensure_l2_for_pairs(thread_id, removed_ids, lang, now_ts)
+        if len(tail_pairs) > fallback:
+            keep = tail_pairs[-fallback:]
+            removed = tail_pairs[:-fallback]
+            if removed:
+                ids3 = [(u.id, a.id) for (u, a) in removed]
+                created2 = repo_ensure_l2(thread_id, ids3, lang, now_ts)
                 if created2:
                     summary_created_l2 += created2
-            compaction_steps.append(f"tail_reduce:{len(tail_pairs_ids)}→{fallback}")
-            # rebuild tail
-            tail_pairs_ids = keep_ids
-            # map ids back to texts
-            id_to_text = {m.id: sanitize_for_memory(m.content or '') for m in msgs}
-            l1_msgs_out.clear()
-            for (uid, aid) in tail_pairs_ids:
-                l1_msgs_out.extend(({'role': 'user', 'content': id_to_text.get(uid, '')}, {'role': 'assistant', 'content': id_to_text.get(aid, '')}))
-            # refresh l2_txt from DB
+            tail_pairs = keep
+            compaction_steps.append(f"tail_reduce:{len(removed)+len(keep)}→{fallback}")
+            l1_msgs_out = _flatten_tail_pairs(tail_pairs)
+            # refresh L2 view
             with session_scope() as s:
                 l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
             l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db])
@@ -314,9 +319,8 @@ async def assemble_context(
         'original_current_user_tokens': toks['current_user_tokens'],
         'free_out_cap': free_out_cap,
         'l1_order': 'chronological',
-        'tail_pairs': len(tail_pairs_ids),
+        'tail_pairs': len(tail_pairs),
         'compaction_steps': compaction_steps,
-        'summary_created': {'l2': summary_created_l2, 'l3': summary_created_l3},
     }
     stats["fill_pct"] = {
         "l1": _pct(stats["tokens"]["l1"], stats["caps"]["l1"]),
@@ -338,5 +342,7 @@ async def assemble_context(
         stats["last_assistant_before_user"] = {"message_id": last_assistant.get("id"), "preview": prev}
     else:
         stats["last_assistant_before_user"] = None
+
+    logger.debug("compact.steps: %s", compaction_steps)
 
     return { 'system_text': system_text, 'messages': l1_msgs_out, 'stats': stats, 'context_budget': budgets }
