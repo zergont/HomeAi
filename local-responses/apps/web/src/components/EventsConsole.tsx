@@ -39,7 +39,8 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const ctxBudget = lastMeta?.data?.metadata?.context_budget
   const ctxAsm = lastMeta?.data?.metadata?.context_assembly
   const order: string[] = Array.isArray(ctxAsm?.order) ? ctxAsm.order : ["core", "tools", "l3", "l2", "l1"]
-
+  const promptPrecise = ctxAsm?.prompt_tokens_precise
+  const tokenCountMode = ctxAsm?.token_count_mode
   // Memory levels progress bars
   const fillPct = ctxAsm?.fill_pct || {}
   const tokens = ctxAsm?.tokens || {}
@@ -194,6 +195,12 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                   </div>
                 ))}
               </div>
+              {(typeof promptPrecise === 'number' || tokenCountMode) && (
+                <div className="mt-1 text-gray-700">
+                  {typeof promptPrecise === 'number' && (<span className="mr-3">prompt_tokens_precise: {promptPrecise}</span>)}
+                  {tokenCountMode && (<span>token_count_mode: {tokenCountMode}</span>)}
+                </div>
+              )}
             </div>
           )}
           {ctxAsm && (

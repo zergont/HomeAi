@@ -50,18 +50,30 @@ export default function App() {
     if (!stream) {
       try {
         const res = await postResponses(body)
+        const ts = new Date().toLocaleTimeString()
+        // meta
+        setEvents(prev => [
+          ...prev,
+          { event: 'meta', data: { id: res.id, created: res.created, model: res.model, provider: res.provider, status: res.status || 'completed', metadata: res.metadata }, ts },
+        ])
         if (res?.metadata?.thread_id) { setThreadId(res.metadata.thread_id); threadIdRef.current = res.metadata.thread_id }
         // capture provider request from backend metadata
         if (res?.metadata?.provider_request) setLastProviderRequest(res.metadata.provider_request)
-        setAssistantText(res.output?.[0]?.content?.[0]?.text || '')
+        // summary event if present
         if (res?.metadata?.summary) {
-          // summary ready immediately
+          setEvents(prev => [...prev, { event: 'summary', data: { summary: res.metadata.summary, summary_updated_at: res.metadata.summary_updated_at }, ts }])
           setSummarizing(false)
           setHistory({ thread_id: res.metadata.thread_id, summary: res.metadata.summary, summary_updated_at: res.metadata.summary_updated_at, messages: [], context: undefined })
         } else {
           // start indicator until we fetch history
           setSummarizing(true); setSummarizeSince(Date.now())
         }
+        // usage
+        if (res?.usage) setEvents(prev => [...prev, { event: 'usage', data: res.usage, ts }])
+        // done
+        setEvents(prev => [...prev, { event: 'done', data: { status: res.status || 'completed' }, ts }])
+        // assistant text
+        setAssistantText(res.output?.[0]?.content?.[0]?.text || '')
         await refreshHistory(res?.metadata?.thread_id || threadIdRef.current)
       } catch (err: any) {
         const msg = (err?.message || 'Request failed') as string

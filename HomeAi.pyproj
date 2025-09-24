@@ -53,6 +53,7 @@
     <Compile Include="local-responses\packages\providers\lmstudio\model_info.py" />
     <Compile Include="local-responses\packages\providers\lmstudio_cache.py" />
     <Compile Include="local-responses\packages\providers\lmstudio_model_info.py" />
+    <Compile Include="local-responses\packages\providers\lmstudio_tokens.py" />
     <Compile Include="local-responses\packages\storage\database.py" />
     <Compile Include="local-responses\packages\storage\models.py" />
     <Compile Include="local-responses\packages\storage\repo.py" />

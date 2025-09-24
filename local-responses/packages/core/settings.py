@@ -76,6 +76,10 @@ class AppSettings(BaseSettings):
     RETRY_PART_MAX_TOK: int = 1500
     RETRY_THINK_MAX_PCT: float = 0.10
 
+    # Token count settings
+    TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")  # "proxy" | "approx" | "provider_usage"
+    TOKEN_CACHE_TTL_SEC: int = Field(default=300, validation_alias="TOKEN_CACHE_TTL_SEC")
+
     @property
     def db_dialect(self) -> str:
         # Extract dialect part from SQLAlchemy URL (e.g., sqlite)

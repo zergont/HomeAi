@@ -27,6 +27,7 @@ from packages.core.logging import configure_logging, request_logging_middleware
 from packages.core.pricing import price_for
 from packages.providers.lmstudio import get_lmstudio_provider
 from packages.providers.lmstudio_model_info import fetch_model_info
+from packages.providers import lmstudio_tokens
 from packages.orchestration.redactor import redact_fragment, safe_profile_output
 from packages.orchestration.context_manager import build_context
 from packages.orchestration.context_builder import assemble_context
@@ -442,6 +443,25 @@ def _ensure_thread(req: ResponsesRequest) -> str:
     return thread_id
 
 
+class TokenizeReq(BaseModel):
+    model: str
+    messages: Optional[list[dict]] = None
+    text: Optional[str] = None
+
+
+@app.post("/providers/lmstudio/tokenize")
+async def tokenize(req: TokenizeReq):
+    if settings.TOKEN_COUNT_MODE != "proxy":
+        return {"error": "TOKEN_COUNT_MODE is not 'proxy'"}
+    if req.messages:
+        n = lmstudio_tokens.count_tokens_chat(req.model, req.messages, settings.TOKEN_CACHE_TTL_SEC)
+        return {"mode": "chat", "prompt_tokens": n}
+    if req.text is not None:
+        n = lmstudio_tokens.count_tokens_text(req.model, req.text, settings.TOKEN_CACHE_TTL_SEC)
+        return {"mode": "text", "prompt_tokens": n}
+    return {"error": "provide messages or text"}
+
+
 @app.post("/responses")
 async def create_response(request: Request, req: ResponsesRequest, stream: bool = False):
     model = req.model
@@ -472,6 +492,25 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     )
     system_text = assembled["system_text"]
     messages_for_provider = ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
+    # precise preflight for stream
+    if stream and settings.TOKEN_COUNT_MODE == "proxy":
+        # compute prompt tokens precisely via SDK proxy
+        try:
+            prompt_tokens = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
+        except Exception:
+            prompt_tokens = None
+        if isinstance(prompt_tokens, int):
+            C_eff = int(assembled["context_budget"].get("C_eff") or 0)
+            R_sys = int(assembled["context_budget"].get("R_sys") or 0)
+            Safety = int(assembled["context_budget"].get("Safety") or 0)
+            free_out_cap_precise = max(0, C_eff - prompt_tokens - R_sys - Safety)
+            requested = req.max_output_tokens or getattr(settings, 'CTX_ROUT_DEFAULT', 512)
+            eff_out = min(int(requested), int(free_out_cap_precise))
+            assembled["context_budget"]["effective_max_output_tokens"] = eff_out
+            # annotate assembly metadata
+            asm = assembled.get("stats", {})
+            asm["prompt_tokens_precise"] = prompt_tokens
+            asm["token_count_mode"] = "proxy"
 
     price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
 
