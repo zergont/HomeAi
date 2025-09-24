@@ -38,11 +38,8 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
 
   const ctxBudget = lastMeta?.data?.metadata?.context_budget
   const ctxAsm = lastMeta?.data?.metadata?.context_assembly
-  const summaryCreated = ctxAsm?.summary_created
-  const compactionSteps = Array.isArray(ctxAsm?.compaction_steps) ? ctxAsm.compaction_steps : []
   const order: string[] = Array.isArray(ctxAsm?.order) ? ctxAsm.order : ["core", "tools", "l3", "l2", "l1"]
-  const promptPrecise = ctxAsm?.prompt_tokens_precise
-  const tokenCountMode = ctxAsm?.token_count_mode
+
   // Memory levels progress bars
   const fillPct = ctxAsm?.fill_pct || {}
   const tokens = ctxAsm?.tokens || {}
@@ -53,6 +50,15 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
 
   // Last assistant before user
   const lastAsst = ctxAsm?.last_assistant_before_user
+
+  const freeOutCap = ctxAsm?.free_out_cap
+
+  // Derived for Tokens section (backward-compatible prompt tokens)
+  const asm = lastMeta?.data?.metadata?.context_assembly ?? {}
+  const bud = lastMeta?.data?.metadata?.context_budget ?? {}
+  const promptTok = typeof asm.prompt_tokens_precise === 'number'
+    ? asm.prompt_tokens_precise
+    : (typeof asm.prompt_tokens_estimate === 'number' ? asm.prompt_tokens_estimate : undefined)
 
   const renderEvent = (e: Ev, i: number) => {
     const badge = (txt: string, cls: string) => (
@@ -156,8 +162,6 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
     }
   }
 
-  const freeOutCap = ctxAsm?.free_out_cap
-
   return (
     <div className="space-y-2">
       {resetBadge && (
@@ -197,56 +201,48 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                   </div>
                 ))}
               </div>
-              {(typeof promptPrecise === 'number' || tokenCountMode) && (
-                <div className="mt-1 text-gray-700">
-                  {typeof promptPrecise === 'number' && (<span className="mr-3">prompt_tokens_precise: {promptPrecise}</span>)}
-                  {tokenCountMode && (<span>token_count_mode: {tokenCountMode}</span>)}
-                </div>
-              )}
             </div>
           )}
           {ctxAsm && (
-            <>
-              <div>
-                <div className="text-gray-600 mb-1">context_assembly</div>
-                <Section title="order">
-                  <div className="flex flex-wrap gap-1">
-                    {order.map((o) => (
-                      <span key={o} className="px-2 py-0.5 rounded bg-gray-100">{o}</span>
+            <div>
+              <div className="text-gray-600 mb-1">context_assembly</div>
+              <Section title="order">
+                <div className="flex flex-wrap gap-1">
+                  {order.map((o) => (
+                    <span key={o} className="px-2 py-0.5 rounded bg-gray-100">{o}</span>
+                  ))}
+                </div>
+              </Section>
+              <Section title="tokens">
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                  {(Object.entries(ctxAsm.tokens || {}) as [string, any][]).map(([k, v]) => (
+                    <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
+                  ))}
+                </div>
+              </Section>
+              <Section title="caps">
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                  {(Object.entries(ctxAsm.caps || {}) as [string, any][]).map(([k, v]) => (
+                    <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
+                  ))}
+                </div>
+              </Section>
+              <Section title="squeezes">
+                {Array.isArray(ctxAsm.squeezes) && ctxAsm.squeezes.length > 0 ? (
+                  <ul className="list-disc pl-5">
+                    {ctxAsm.squeezes.map((s: string, i: number) => (
+                      <li key={i}>{s}</li>
                     ))}
-                  </div>
-                </Section>
-                <Section title="tokens">
-                  <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                    {(Object.entries(ctxAsm.tokens || {}) as [string, any][]).map(([k, v]) => (
-                      <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
-                    ))}
-                  </div>
-                </Section>
-                <Section title="caps">
-                  <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                    {(Object.entries(ctxAsm.caps || {}) as [string, any][]).map(([k, v]) => (
-                      <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
-                    ))}
-                  </div>
-                </Section>
-                <Section title="squeezes">
-                  {Array.isArray(ctxAsm.squeezes) && ctxAsm.squeezes.length > 0 ? (
-                    <ul className="list-disc pl-5">
-                      {ctxAsm.squeezes.map((s: string, i: number) => (
-                        <li key={i}>{s}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <span className="text-gray-500">—</span>
-                  )}
-                </Section>
-                {(typeof ctxAsm.squeezed === 'boolean' || typeof ctxAsm.current_user_only_mode === 'boolean') && (
-                  <div className="mt-1 text-gray-700">
-                    squeezed: {String(ctxAsm.squeezed)}; current_user_only_mode: {String(ctxAsm.current_user_only_mode)}
-                  </div>
+                  </ul>
+                ) : (
+                  <span className="text-gray-500">—</span>
                 )}
-              </div>
+              </Section>
+              {(typeof ctxAsm.squeezed === 'boolean' || typeof ctxAsm.current_user_only_mode === 'boolean') && (
+                <div className="mt-1 text-gray-700">
+                  squeezed: {String(ctxAsm.squeezed)}; current_user_only_mode: {String(ctxAsm.current_user_only_mode)}
+                </div>
+              )}
               <Section title="Memory levels">
                 {memLevels.map(lvl => (
                   <div key={lvl} className="mb-1">
@@ -264,43 +260,33 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                 ))}
                 <div className="text-[11px] text-gray-500 mt-1">L1 — последние пары без сжатия</div>
               </Section>
-              {summaryCreated && (
+              {ctxAsm?.summary_created && (
                 <Section title="Summaries created this request">
                   <div className="grid grid-cols-2 gap-2">
-                    <div className="rounded bg-gray-50 px-2 py-1">Summary L2 created: {summaryCreated.l2 || 0}</div>
-                    <div className="rounded bg-gray-50 px-2 py-1">Summary L3 created: {summaryCreated.l3 || 0}</div>
+                    <div className="rounded bg-gray-50 px-2 py-1">Summary L2 created: {ctxAsm.summary_created.l2 || 0}</div>
+                    <div className="rounded bg-gray-50 px-2 py-1">Summary L3 created: {ctxAsm.summary_created.l3 || 0}</div>
                   </div>
                 </Section>
               )}
-              {compactionSteps.length > 0 && (
+              {Array.isArray(ctxAsm?.compaction_steps) && ctxAsm.compaction_steps.length > 0 && (
                 <Section title="Compaction steps">
                   <ul className="list-disc pl-5">
-                    {compactionSteps.map((s: string, i: number) => (
+                    {ctxAsm.compaction_steps.map((s: string, i: number) => (
                       <li key={i}>{s.replace('l1_to_l2', 'L1→L2').replace('l2_to_l3','L2→L3').replace('tail_reduce','Хвост').replace('drop_tools','Убраны инструменты').replace('shrink_core','Урезан Core')}</li>
                     ))}
                   </ul>
                 </Section>
               )}
-              <Section title="Last assistant before user">
-                {lastAsst?.preview ? (
-                  <div className="border rounded bg-gray-50 px-2 py-1 text-xs">
-                    <span className="text-gray-500 mr-2">Preview:</span>
-                    <span className="font-mono">{lastAsst.preview}</span>
-                  </div>
-                ) : (
-                  <span className="text-gray-400">нет данных</span>
-                )}
-              </Section>
-            </>
+            </div>
           )}
-          {lastMeta?.data?.metadata?.retry && (
-            <div className="mt-2 text-blue-700">Retry: {JSON.stringify(lastMeta.data.metadata.retry)}</div>
-          )}
-          {ctxAsm?.think_truncated && (
-            <div className="mt-1 text-orange-700">think_truncated: {String(ctxAsm.think_truncated)}</div>
-          )}
-          {lastMeta?.data?.metadata?.tool_runs_first_attempt !== undefined && (
-            <div className="mt-1 text-green-700">tool_runs_first_attempt: {String(lastMeta.data.metadata.tool_runs_first_attempt)}</div>
+          {(asm.token_count_mode || typeof promptTok === 'number' || typeof asm.free_out_cap === 'number' || typeof bud.effective_max_output_tokens === 'number') && (
+            <div className="mt-3 border rounded p-2">
+              <div className="font-semibold mb-1">Tokens</div>
+              {asm.token_count_mode && <div>Token count mode: <b>{asm.token_count_mode}</b></div>}
+              {typeof promptTok === 'number' && <div>Prompt tokens (SDK): <b>{promptTok}</b></div>}
+              {typeof asm.free_out_cap === 'number' && <div>Free out cap: <b>{asm.free_out_cap}</b></div>}
+              {typeof bud.effective_max_output_tokens === 'number' && <div>Max output (effective): <b>{bud.effective_max_output_tokens}</b></div>}
+            </div>
           )}
         </div>
       )}

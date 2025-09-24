@@ -43,7 +43,7 @@ from packages.storage.repo import (
     save_profile as repo_save_profile,
 )
 from packages.storage.models import Message, Thread
-from packages.utils.tokens import approx_tokens, profile_text_view
+from packages.utils.tokens import approx_tokens, profile_text_view, approx_tokens_messages
 from packages.orchestration.memory_manager import update_memory
 from packages.orchestration.tool_runtime import ToolRuntime
 from packages.orchestration.stream_handlers import ToolCallAssembler
@@ -463,6 +463,10 @@ async def tokenize(req: TokenizeReq):
     return {"error": "provide messages or text"}
 
 
+async def send_sse_meta(queue, payload: Dict[str, Any]):
+    await queue.put(await _sse_format("meta", payload))
+
+
 @app.post("/responses")
 async def create_response(request: Request, req: ResponsesRequest, stream: bool = False):
     model = req.model
@@ -473,6 +477,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
     provider = get_lmstudio_provider()
     provider_info = {"name": "lmstudio", "base_url": str(settings.lmstudio_base_url)}
+
+    # Define price per 1k tokens once for both modes
+    price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
 
     thread_id = _ensure_thread(req)
     ctx = build_context(thread_id)
@@ -493,49 +500,27 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     )
     system_text = assembled["system_text"]
     messages_for_provider = ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
-    # precise preflight for stream
-    if stream and settings.TOKEN_COUNT_MODE == "proxy":
-        # compute prompt tokens precisely via SDK proxy
-        try:
-            prompt_tokens = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
-        except Exception:
-            prompt_tokens = None
-        if isinstance(prompt_tokens, int):
-            C_eff = int(assembled["context_budget"].get("C_eff") or 0)
-            R_sys = int(assembled["context_budget"].get("R_sys") or 0)
-            Safety = int(assembled["context_budget"].get("Safety") or 0)
-            free_out_cap_precise = max(0, C_eff - prompt_tokens - R_sys - Safety)
-            requested = req.max_output_tokens or getattr(settings, 'CTX_ROUT_DEFAULT', 512)
-            eff_out = min(int(requested), int(free_out_cap_precise))
-            assembled["context_budget"]["effective_max_output_tokens"] = eff_out
-            # annotate assembly metadata
-            asm = assembled.get("stats", {})
-            asm["prompt_tokens_precise"] = prompt_tokens
-            asm["token_count_mode"] = "proxy"
 
-    price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
-
-    log_lm.info("lmstudio.request: model_id=%s base_url=%s stream=%s", provider_model, provider_info["base_url"], bool(stream))
-
-    metadata = {"context_budget": assembled.get("context_budget"), "context_assembly": assembled.get("stats", {})}
-    requested = req.max_output_tokens or getattr(settings, 'CTX_ROUT_DEFAULT', 512)
-    base_out = int(metadata["context_budget"].get("effective_max_output_tokens") or requested)
-    free_out_cap = int(assembled["stats"].get("free_out_cap", base_out))
-    eff_out = min(int(requested), int(free_out_cap))
-    if eff_out > base_out:
-        metadata["context_budget"]["effective_max_output_tokens"] = int(eff_out)
-    max_tokens_for_provider = int(metadata["context_budget"]["effective_max_output_tokens"])  # authoritative
-
-    meta_common = {
-        "thread_id": thread_id,
-        "context_budget": metadata["context_budget"],
-        "context_assembly": metadata["context_assembly"],
-    }
-
+    # Preflight tokens with silence protection
     try:
-        append_message(thread_id, "user", req.input)
+        prompt_tok = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
+        token_mode = "proxy"
     except Exception:
-        pass
+        prompt_tok = approx_tokens_messages(messages_for_provider)
+        token_mode = "approx"
+    C_eff = int(assembled["context_budget"].get("C_eff") or 0)
+    R_sys = int(assembled["context_budget"].get("R_sys") or 0)
+    Safety = int(assembled["context_budget"].get("Safety") or 0)
+    free_out = max(0, C_eff - int(prompt_tok) - R_sys - Safety)
+    requested_mt = req.max_output_tokens or int(assembled["context_budget"].get("effective_max_output_tokens") or 0) or getattr(settings, 'CTX_ROUT_DEFAULT', 512)
+    eff_out = int(min(requested_mt, free_out))
+    assembled["context_budget"]["effective_max_output_tokens"] = eff_out
+
+    # metadata base
+    metadata = {"context_budget": assembled.get("context_budget"), "context_assembly": assembled.get("stats", {})}
+    metadata["context_assembly"]["token_count_mode"] = token_mode
+    metadata["context_assembly"]["prompt_tokens_precise"] = int(prompt_tok)
+    metadata["context_assembly"]["free_out_cap"] = int(free_out)
 
     provider_request = {
         "url": f"{provider_info['base_url'].rstrip('/')}/v1/chat/completions",
@@ -543,11 +528,12 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             "model": provider_model,
             "messages": messages_for_provider,
             "temperature": req.temperature,
-            "max_tokens": max_tokens_for_provider,
+            "max_tokens": eff_out,
             **({"stream": True} if stream else {}),
         },
     }
 
+    # Non-stream: return final metadata with preflight info
     if not stream:
         log_lm.info("lmstudio.generate start: model_id=%s", provider_model)
         try:
@@ -556,10 +542,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                 user="",
                 model=provider_model,
                 temperature=req.temperature,
-                max_tokens=max_tokens_for_provider,
+                max_tokens=eff_out,
                 messages=messages_for_provider,
             )
-            # Non-stream: detect and execute tool-calls in text
             tool_calls = []
             assembler = ToolCallAssembler()
             for call in assembler.feed(text):
@@ -587,20 +572,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         usage_vals = usage_dict or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
         out_item = ResponsesOutputItem(content=[{"type": "output_text", "text": text}])
-        # metrics
-        stats = assembled.get("stats", {})
-        parts = stats.get("tokens", {})
-
-        for k in ("core","tools","l1","l2","l3"):
-            LR_CTX_TOKENS.labels(k).inc(parts.get(k, 0))
-
-        sq = stats.get("squeezes", [])
-        if sq:
-            LR_CTX_OVERFLOW.inc()
-            for sname in sq:
-                kind = sname.split(":",1)[0]
-                LR_CTX_SQUEEZES.labels(kind).inc()
-
+        meta_common = {"thread_id": thread_id, "context_budget": metadata["context_budget"], "context_assembly": metadata["context_assembly"]}
         resp = ResponsesResponse(
             id=f"resp_{uuid4().hex}",
             created=int(time.time()),
@@ -637,15 +609,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             summary_reason = "error"
         with session_scope() as s:
             t = s.get(Thread, thread_id)
-            extra = {
-                "summary_scheduled": bool(summary_reason == "scheduled"),
-                "summary_reason": summary_reason,
-            }
+            extra = {"summary_scheduled": bool(summary_reason == "scheduled"), "summary_reason": summary_reason}
             if t and t.summary:
-                extra |= {
-                    "summary": t.summary,
-                    "summary_updated_at": t.summary_updated_at.isoformat() if t.summary_updated_at else None,
-                }
+                extra |= {"summary": t.summary, "summary_updated_at": t.summary_updated_at.isoformat() if t.summary_updated_at else None}
             resp.metadata = (resp.metadata or {}) | extra
         return JSONResponse(content=resp.model_dump())
 
@@ -669,20 +635,15 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     if cancel_flag["cancelled"]:
                         break
                     if time.monotonic() - last_delta_ts > 8:
-                        await queue.put(
-                            await _sse_format("ping", {"ts": datetime.now(timezone.utc).isoformat()})
-                        )
+                        await queue.put(await _sse_format("ping", {"ts": datetime.now(timezone.utc).isoformat()}))
             except asyncio.CancelledError:
                 pass
 
         async def produce_loop():
             nonlocal last_delta_ts
-            await queue.put(
-                await _sse_format(
-                    "meta",
-                    {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": meta_common | {"provider_request": provider_request}},
-                )
-            )
+            # First meta with preflight results
+            meta_payload = {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id, "context_budget": metadata["context_budget"], "context_assembly": metadata["context_assembly"], "provider_request": provider_request}}
+            await send_sse_meta(queue, meta_payload)
             try:
                 log_lm.info("lmstudio.agenerate_stream start: model_id=%s", provider_model)
                 async for frag in provider.agenerate_stream(
@@ -690,7 +651,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     user="",
                     model=provider_model,
                     temperature=req.temperature,
-                    max_tokens=max_tokens_for_provider,
+                    max_tokens=eff_out,
                     messages=messages_for_provider,
                 ):
                     if cancel_flag["cancelled"]:
@@ -698,15 +659,11 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     last_delta_ts = time.monotonic()
                     text = frag
                     collected.append(text)
-                    # Tool-call execution (safe):
                     for call in assembler.feed(text):
                         if call and isinstance(call, dict) and "name" in call and "arguments" in call:
                             tool_runtime.try_execute(call["name"], call["arguments"])
-                    await queue.put(
-                        await _sse_format("delta", {"index": 0, "type": "output_text.delta", "text": text})
-                    )
+                    await queue.put(await _sse_format("delta", {"index": 0, "type": "output_text.delta", "text": text}))
             except Exception as exc:  # noqa: BLE001
-                # Map to friendly message and include provider request for UI troubleshooting
                 if isinstance(exc, httpx.RequestError):
                     msg = f"Failed to reach LM Studio: {exc}"
                 elif isinstance(exc, httpx.HTTPStatusError):
@@ -724,62 +681,22 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
             final_text = "".join(collected)
             usage_vals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-            # Persist assistant message and response and autosummarize
             append_message(thread_id, "assistant", final_text, tokens=usage_vals)
             cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
-            response_json = json.dumps(
-                {
-                    "id": resp_id,
-                    "object": "response",
-                    "created": created,
-                    "model": provider_model,
-                    "status": "completed",
-                    "output": [
-                        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": final_text}]}
-                    ],
-                    "usage": usage_vals,
-                    "provider": provider_info,
-                    "metadata": {"thread_id": thread_id},
-                },
-                ensure_ascii=False,
-            )
-            save_response(
-                resp_id=resp_id,
-                thread_id=thread_id,
-                request_json=json.dumps(req.model_dump(), ensure_ascii=False),
-                response_json=response_json,
-                status="cancelled" if cancel_flag["cancelled"] else "completed",
-                model=provider_model,
-                provider_name=provider_info["name"],
-                provider_base_url=provider_info["base_url"],
-                usage=usage_vals,
-                cost=cost,
-            )
+            response_json = json.dumps({"id": resp_id, "object": "response", "created": created, "model": provider_model, "status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": final_text}]}], "usage": usage_vals, "provider": provider_info, "metadata": {"thread_id": thread_id}}, ensure_ascii=False)
+            save_response(resp_id=resp_id, thread_id=thread_id, request_json=json.dumps(req.model_dump(), ensure_ascii=False), response_json=response_json, status="cancelled" if cancel_flag["cancelled"] else "completed", model=provider_model, provider_name=provider_info["name"], provider_base_url=provider_info["base_url"], usage=usage_vals, cost=cost)
             try:
                 tool_results_tokens = 0
                 mem = await update_memory(thread_id, assembled.get("context_budget", {}), tool_results_tokens, int(time.time()))
                 await queue.put(await _sse_format("meta.update", {"memory": mem}))
             except Exception:
                 pass
-
-            # Send summary event immediately if exists
             with session_scope() as s:
                 t = s.get(Thread, thread_id)
                 meta = {"summary_scheduled": False, "summary_reason": "stream"}
                 await queue.put(await _sse_format("meta.update", meta))
                 if t and t.summary:
-                    await queue.put(
-                        await _sse_format(
-                            "summary",
-                            {
-                                "summary": t.summary,
-                                "summary_updated_at": t.summary_updated_at.isoformat() if t.summary_updated_at else None,
-                            },
-                        )
-                    )
-
-            # Now send usage and done
+                    await queue.put(await _sse_format("summary", {"summary": t.summary, "summary_updated_at": t.summary_updated_at.isoformat() if t.summary_updated_at else None}))
             await queue.put(await _sse_format("usage", usage_vals))
             await queue.put(await _sse_format("done", {"status": "cancelled" if cancel_flag["cancelled"] else "completed"}))
             done_event.set()
@@ -798,17 +715,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         except asyncio.CancelledError:
             cancel_flag["cancelled"] = True
         finally:
-            prod_task.cancel()
-            hb_task.cancel()
-            ACTIVE_STREAMS.pop(resp_id, None)
+            prod_task.cancel(); hb_task.cancel(); ACTIVE_STREAMS.pop(resp_id, None)
 
-    headers = {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-
+    headers = {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_iter(), headers=headers)
 
 

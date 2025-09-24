@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 
 def approx_tokens(text: str) -> int:
     """Rough token estimate: 1 token ~= 4 chars."""
     return int(math.ceil(len(text or "") / 4))
+
+
+def approx_tokens_messages(messages: List[Dict[str, Any]]) -> int:
+    """Heuristic prompt tokens for chat-style messages (sum of contents)."""
+    total = 0
+    for m in messages or []:
+        total += approx_tokens(str(m.get("content", "")))
+    return total
 
 
 def profile_text_view(profile: Dict[str, Any]) -> str:
