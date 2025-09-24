@@ -316,3 +316,61 @@ def insert_tool_run(thread_id: str, attempt_id: str, tool_name: str, args_json: 
         s.add(run)
         s.commit()
         return run
+
+# New: On-demand summarization helpers used by compaction
+
+def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str, now: int) -> int:
+    """pairs: list of (user_msg_id, assistant_msg_id). Create L2 if absent for each pair.
+    Returns number of L2 created."""
+    created = 0
+    with session_scope() as s:
+        for (uid, aid) in pairs:
+            exists = s.query(L2Summary).filter(
+                L2Summary.thread_id == thread_id,
+                L2Summary.start_message_id == uid,
+                L2Summary.end_message_id == aid,
+            ).first()
+            if exists:
+                continue
+            um = s.get(Message, uid)
+            am = s.get(Message, aid)
+            if not um or not am:
+                continue
+            # naive concise summary: 1-3 lines, key points
+            u_short = (um.content or '').strip().splitlines()[0][:200]
+            a_short = (am.content or '').strip().splitlines()[0][:200]
+            lines = [f"- {u_short} → {a_short}"]
+            text = "\n".join(lines)
+            toks = approx_tokens(text)
+            rec = L2Summary(
+                thread_id=thread_id,
+                start_message_id=uid,
+                end_message_id=aid,
+                text=text,
+                tokens=toks,
+                created_at=now,
+            )
+            s.add(rec)
+            created += 1
+    return created
+
+
+def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> int:
+    """Create one L3 from given L2 ids (oldest-first) and delete those L2. Returns number of L3 created (0/1)."""
+    if not l2_ids:
+        return 0
+    with session_scope() as s:
+        items = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id, L2Summary.id.in_(l2_ids)).order_by(L2Summary.id.asc()))
+        if not items:
+            return 0
+        bullets = [f"• {x.text.splitlines()[0][:200]}" for x in items]
+        text = "\n".join(bullets[:2])  # keep 1-2 theses
+        toks = approx_tokens(text)
+        start_id = items[0].id
+        end_id = items[-1].id
+        l3 = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=text, tokens=toks, created_at=now)
+        s.add(l3)
+        # delete promoted L2
+        for x in items:
+            s.delete(x)
+        return 1

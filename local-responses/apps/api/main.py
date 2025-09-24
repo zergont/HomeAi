@@ -55,13 +55,14 @@ try:
     LR_CTX_OVERFLOW = Counter('lr_context_overflow_prevented_total', 'Context squeezes occurred')
     LR_CTX_TOKENS = Counter('lr_context_tokens_total', 'Context tokens total by part', ['part'])
     LR_CTX_SQUEEZES = Counter('lr_context_squeezes_total', 'Squeeze actions total', ['type'])
+    LR_SUMMARY_CREATED = Counter('lr_summary_created_total', 'Summaries created by compaction', ['level'])
+    LR_COMPACTION_STEPS = Counter('lr_compaction_steps_total', 'Compaction steps', ['type'])
 except Exception:  # fallback dummies
     class _Dummy:
         def labels(self, *a, **k): return self
         def inc(self, *a, **k): pass
-    LR_CTX_OVERFLOW = _Dummy()
-    LR_CTX_TOKENS = _Dummy()
-    LR_CTX_SQUEEZES = _Dummy()
+    LR_CTX_OVERFLOW = _Dummy(); LR_CTX_TOKENS = _Dummy(); LR_CTX_SQUEEZES = _Dummy()
+    LR_SUMMARY_CREATED = _Dummy(); LR_COMPACTION_STEPS = _Dummy()
 
 settings = get_settings()
 configure_logging(level=settings.log_level)

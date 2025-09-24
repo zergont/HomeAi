@@ -66,29 +66,22 @@ class AppSettings(BaseSettings):
     price_per_1k_default: float = Field(default=0.0, validation_alias="PRICE_PER_1K_DEFAULT")
     price_overrides: Dict[str, float] = Field(default_factory=dict)
 
-    # Tool runs settings
-    TOOL_RUNS_CACHE_TTL_SEC: int = 86400  # сутки
-    TOOL_ARGS_HASH_ALGO: str = "sha256"
-
-    # Retry settings
-    RETRY_ON_LENGTH_ENABLED: bool = True
-    RETRY_ON_LENGTH_MAX: int = 1
-    RETRY_PART_MAX_TOK: int = 1500
-    RETRY_THINK_MAX_PCT: float = 0.10
-
-    # Token count settings
-    TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")  # "proxy" | "approx" | "provider_usage"
+    # Token counting proxy
+    TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")
     TOKEN_CACHE_TTL_SEC: int = Field(default=300, validation_alias="TOKEN_CACHE_TTL_SEC")
+
+    # New L1 tail behavior and compaction flags
+    L1_TAIL_UNCLIPPED_PAIRS: int = Field(default=4, validation_alias="L1_TAIL_UNCLIPPED_PAIRS")
+    L1_TAIL_FALLBACK_PAIRS: int = Field(default=2, validation_alias="L1_TAIL_FALLBACK_PAIRS")
+    SUMMARIZE_INSTEAD_OF_TRIM: bool = Field(default=True, validation_alias="SUMMARIZE_INSTEAD_OF_TRIM")
 
     @property
     def db_dialect(self) -> str:
-        # Extract dialect part from SQLAlchemy URL (e.g., sqlite)
         return self.db_url.split(":", 1)[0] if ":" in self.db_url else self.db_url
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> AppSettings:
-    # Load dynamic price overrides from env like PRICE__lmstudio__default=0.0
     import os
 
     overrides: Dict[str, float] = {}

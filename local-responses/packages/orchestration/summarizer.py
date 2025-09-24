@@ -19,6 +19,55 @@ from packages.orchestration.redactor import redact_fragment
 from packages.orchestration.context_manager import build_summary_source
 
 
+async def summarize_pair_to_l2(user_text: str, assistant_text: str, lang: str) -> str:
+    s = get_settings()
+    provider = get_lmstudio_provider()
+    system = (
+        "Суммируй диалоговую пару кратко, в 1-3 пунктах. Без лишней воды."
+        if lang == "ru"
+        else "Summarize the user→assistant pair briefly in 1-3 bullet points."
+    )
+    user = f"User:\n{user_text}\n\nAssistant:\n{assistant_text}\n\n" + ("Сделай конспективно, по делу." if lang == "ru" else "Be concise, to the point.")
+    try:
+        text, _ = await provider.generate(
+            system=system,
+            user=user,
+            model=s.default_summary_model,
+            temperature=0.2,
+            max_tokens=300,
+        )
+        return redact_fragment(text)
+    except Exception:
+        # fallback: naive bullet
+        u = (user_text or "").strip().splitlines()[0][:200]
+        a = (assistant_text or "").strip().splitlines()[0][:200]
+        return f"- {u} → {a}"
+
+
+async def summarize_l2_block_to_l3(l2_texts: List[str], lang: str) -> str:
+    s = get_settings()
+    provider = get_lmstudio_provider()
+    system = (
+        "Сверни итоги L2 в микро-тезисы (каждый одной строкой)."
+        if lang == "ru"
+        else "Condense L2 items into single-line micro-theses."
+    )
+    joined = "\n".join(l2_texts)
+    user = joined + ("\n\nСделай очень кратко." if lang == "ru" else "\n\nMake it very concise.")
+    try:
+        text, _ = await provider.generate(
+            system=system,
+            user=user,
+            model=s.default_summary_model,
+            temperature=0.2,
+            max_tokens=256,
+        )
+        return redact_fragment(text)
+    except Exception:
+        bullets = [f"• {t.splitlines()[0][:200]}" for t in l2_texts]
+        return "\n".join(bullets)
+
+
 def _detect_lang(messages: List[Dict[str, str]]) -> Optional[str]:
     for m in reversed(messages):
         if m.get("role") == "user":

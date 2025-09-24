@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+import math, time
 from typing import Any, Dict, List, Optional, Tuple
 
 from packages.core.settings import get_settings
@@ -10,6 +10,7 @@ from packages.storage.repo import get_profile, session_scope
 from packages.storage.models import L2Summary, L3MicroSummary, Message
 from packages.utils.tokens import approx_tokens, profile_text_view
 from packages.utils.i18n import pick_lang, t
+from packages.providers import lmstudio_tokens
 
 
 def _cap_text_by_tokens(txt: str, cap: int) -> str:
@@ -33,6 +34,25 @@ def _condense_assistant(text: str, lang_ru: bool) -> str:
     return (first if not numbers else f"{first}\n{'Ключевые числа/параметры' if lang_ru else 'Key numbers/params'}: {numbers}")
 
 
+def _pairs_with_ids(msgs: List[Message]) -> Tuple[List[Tuple[str,str]], List[Tuple[str,str]]]:
+    # returns (pairs_ids, pairs_texts) in chronological order
+    pairs_ids: List[Tuple[str,str]] = []
+    pairs_txt: List[Tuple[str,str]] = []
+    i = 0
+    while i < len(msgs) - 1:
+        if msgs[i].role == 'user' and msgs[i+1].role == 'assistant':
+            uid = msgs[i].id
+            aid = msgs[i+1].id
+            u = sanitize_for_memory(msgs[i].content or '')
+            a = sanitize_for_memory(msgs[i+1].content or '')
+            pairs_ids.append((uid, aid))
+            pairs_txt.append((u, a))
+            i += 2
+        else:
+            i += 1
+    return pairs_ids, pairs_txt
+
+
 async def assemble_context(
     thread_id: str,
     model_id: str,
@@ -44,7 +64,6 @@ async def assemble_context(
 ) -> Dict[str, Any]:
     st = get_settings()
 
-    # Profile & language
     prof = get_profile()
     lang = pick_lang(last_user_lang, prof.preferred_language)
 
@@ -67,23 +86,19 @@ async def assemble_context(
         'hardware_hint': prof.hardware_hint,
     }
     core_text_full = profile_text_view(prof_dict)
-    # track mutable core text used in system block
     core_text_cur = core_text_full
     core_tokens = approx_tokens(core_text_full)
     core_cap = int(math.ceil(core_tokens * 1.10))
 
-    # Budgets from model window (R_out subtracted before B_work/core_reserved)
     budgets = await compute_budgets(model_id, max_output_tokens, core_tokens=core_tokens, core_cap=core_cap, settings=st)
 
     B_work = int(budgets.get('B_work', 0))
-    # Tools caps and usage
     tools_cap = int(math.floor(min(st.mem_tools_max_share * B_work, B_work)))
     if tool_results_text and tool_results_tokens is None:
         tool_results_tokens = approx_tokens(tool_results_text)
     tools_src_txt = tool_results_text or ''
     tools_used = min(int(tool_results_tokens or approx_tokens(tools_src_txt)), tools_cap)
 
-    # Distribute level caps from remaining work
     work_left = max(0, B_work - tools_used)
     L1_cap = int(math.floor(st.mem_l1_share * work_left))
     L2_cap = int(math.floor(st.mem_l2_share * work_left))
@@ -105,9 +120,9 @@ async def assemble_context(
     # L2 newest first
     l2_txt = ''
     with session_scope() as s:
-        l2_items = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
-    if l2_items and L2_cap > 0:
-        bullets2 = [f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items]
+        l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
+    if l2_items_db and L2_cap > 0:
+        bullets2 = [f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db]
         acc2: List[str] = []
         for b in bullets2:
             if approx_tokens("\n".join(acc2 + [b])) > L2_cap:
@@ -115,70 +130,26 @@ async def assemble_context(
             acc2.append(b)
         l2_txt = "\n".join(acc2)
 
-    # L1 newest->oldest under caps
-    from packages.storage.repo import get_messages_since, get_or_create_memory_state
+    # Build pairs and tail
+    from packages.storage.repo import get_messages_since, get_or_create_memory_state, ensure_l2_for_pairs, promote_l2_to_l3
     state = get_or_create_memory_state(thread_id)
     msgs = get_messages_since(thread_id, state.last_compacted_message_id)
+    pairs_ids_all, pairs_all = _pairs_with_ids(msgs)
+    tail_N = int(getattr(st, 'L1_TAIL_UNCLIPPED_PAIRS', 4))
+    tail_pairs = pairs_all[-tail_N:] if tail_N > 0 else []
+    tail_pairs_ids = pairs_ids_all[-tail_N:] if tail_N > 0 else []
+    senior_pairs = pairs_all[:-tail_N] if tail_N > 0 else pairs_all
+    senior_pairs_ids = pairs_ids_all[:-tail_N] if tail_N > 0 else []
 
-    # Fallback: ensure we always include the last assistant with its nearest previous user
-    if not msgs or (msgs and msgs[-1].role != 'assistant'):
-        with session_scope() as s:
-            all_items = [m for m in s.query(Message).filter(Message.thread_id == thread_id).order_by(Message.created_at.asc()) if m.role in ("user","assistant")]
-        if all_items:
-            idx_asst = None
-            for k in range(len(all_items)-1, -1, -1):
-                if all_items[k].role == 'assistant':
-                    idx_asst = k
-                    break
-            if idx_asst is not None:
-                # find nearest previous user
-                start_idx = None
-                for j in range(idx_asst-1, -1, -1):
-                    if all_items[j].role == 'user':
-                        start_idx = j
-                        break
-                if start_idx is None:
-                    start_idx = idx_asst  # no user before, include assistant alone
-                msgs = all_items[start_idx:idx_asst+1]
+    # Compose L1 messages from tail (chronological)
+    l1_msgs_out: List[Dict[str, str]] = []
+    for (u, a) in tail_pairs:
+        l1_msgs_out.extend(({'role': 'user', 'content': u}, {'role': 'assistant', 'content': a}))
 
-    cap_user = getattr(st, 'cap_tok_user', 120)
-    cap_asst = getattr(st, 'cap_tok_assistant', 80)
-    l1_msgs: List[Dict[str, str]] = []
-    lang_ru = (lang == 'ru')
-    def l1_total_tokens() -> int:
-        return sum(approx_tokens(m['content']) for m in l1_msgs)
-    i = len(msgs) - 1
-    while i >= 1:
-        if msgs[i].role == 'assistant' and msgs[i-1].role == 'user':
-            u_txt = msgs[i-1].content or ''
-            a_txt = msgs[i].content or ''
-            if approx_tokens(u_txt) > cap_user:
-                u_txt = _cap_text_by_tokens(u_txt, cap_user)
-            if approx_tokens(a_txt) > cap_asst:
-                a_txt = _cap_text_by_tokens(_condense_assistant(a_txt, lang_ru), cap_asst)
-            if l1_total_tokens() + approx_tokens(u_txt) + approx_tokens(a_txt) > L1_cap:
-                a_try = _cap_text_by_tokens(_condense_assistant(a_txt, lang_ru), max(20, int(cap_asst/2)))
-                if l1_total_tokens() + approx_tokens(u_txt) + approx_tokens(a_try) <= L1_cap:
-                    a_txt = a_try
-                else:
-                    i -= 2
-                    continue
-            l1_msgs.append({'role': 'user', 'content': sanitize_for_memory(u_txt)})
-            l1_msgs.append({'role': 'assistant', 'content': sanitize_for_memory(a_txt)})
-            i -= 2
-        else:
-            i -= 1
-    l1_msgs_out = list(reversed(l1_msgs))
-
-    # Build system and tokens
+    # Build system
     D = t(lang, 'divider')
     def build_system(core_text: str, tools_text: str, l3_text: str, l2_text: str) -> str:
-        blocks: List[str] = [
-            t(lang, 'instruction'),
-            D,
-            t(lang, 'core_profile'),
-            core_text,
-        ]
+        blocks: List[str] = [t(lang, 'instruction'), D, t(lang, 'core_profile'), core_text]
         if tools_text:
             blocks += [D, t(lang, 'tool_results'), tools_text]
         if l3_text:
@@ -190,38 +161,162 @@ async def assemble_context(
     tools_text = sanitize_for_memory(tools_src_txt[:tools_cap*4]) if tools_used > 0 and tools_src_txt else ''
     system_text = build_system(core_text_cur, tools_text, l3_txt, l2_txt)
 
-    core_tok = approx_tokens(core_text_cur)
-    tools_tok = approx_tokens(tools_text) if tools_text else 0
-    l3_tok = approx_tokens(l3_txt) if l3_txt else 0
-    l2_tok = approx_tokens(l2_txt) if l2_txt else 0
-    l1_tok = sum(approx_tokens(m['content']) for m in l1_msgs)
-    current_user_tokens = approx_tokens(current_user_text or "")
-    total_in = core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
-    squeezed: List[str] = []
-    B_total_in = int(budgets.get('B_total_in', 0))
-    def total() -> int:
-        return core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
+    def recalc_tokens() -> Dict[str, int]:
+        core_tok = approx_tokens(core_text_cur)
+        tools_tok = approx_tokens(tools_text) if tools_text else 0
+        l3_tok = approx_tokens(l3_txt) if l3_txt else 0
+        l2_tok = approx_tokens(l2_txt) if l2_txt else 0
+        l1_tok = sum(approx_tokens(m['content']) for m in l1_msgs_out)
+        current_user_tokens = approx_tokens(current_user_text or "")
+        total_in = core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
+        return {'core_tok': core_tok, 'tools_tok': tools_tok, 'l3_tok': l3_tok, 'l2_tok': l2_tok, 'l1_tok': l1_tok, 'current_user_tokens': current_user_tokens, 'total_in': total_in}
 
+    def preflight_and_adjust(messages_for_provider: List[Dict[str,str]]) -> Optional[int]:
+        if getattr(st, 'TOKEN_COUNT_MODE', 'proxy') != 'proxy':
+            return None
+        try:
+            mid = model_id.split(":", 1)[1] if model_id.startswith("lm:") else model_id
+            n = lmstudio_tokens.count_tokens_chat(mid, messages_for_provider, getattr(st, 'TOKEN_CACHE_TTL_SEC', 300))
+            C_eff = int(budgets.get('C_eff', 0)); R_sys = int(budgets.get('R_sys', 0)); Safety = int(budgets.get('Safety', 0))
+            requested = int(max_output_tokens or getattr(st, 'ctx_rout_default', 512))
+            eff_out = max(0, min(requested, C_eff - n - R_sys - Safety))
+            budgets['effective_max_output_tokens'] = eff_out
+            return int(n)
+        except Exception:
+            return None
+
+    toks = recalc_tokens()
+    messages_for_provider = ([{"role": "system", "content": system_text}] + l1_msgs_out + [{"role": "user", "content": current_user_text or ''}])
+    prompt_tokens_precise = preflight_and_adjust(messages_for_provider)
+    token_count_mode = 'proxy' if prompt_tokens_precise is not None else None
+
+    def overflows(total_in: int) -> bool:
+        return total_in + int(budgets.get('R_out', 0)) + int(budgets.get('R_sys', 0)) + int(budgets.get('Safety', 0)) > int(budgets.get('C_eff', 0))
+
+    def rebuild():
+        nonlocal system_text, messages_for_provider, toks
+        system_text = build_system(core_text_cur, tools_text, l3_txt, l2_txt)
+        messages_for_provider = ([{"role": "system", "content": system_text}] + l1_msgs_out + [{"role": "user", "content": current_user_text or ''}])
+        toks.update(recalc_tokens())
+
+    compaction_steps: List[str] = []
+    summary_created_l2 = 0
+    summary_created_l3 = 0
+    now_ts = int(time.time())
+
+    max_cycles = 10
+    while overflows(toks['total_in']) and max_cycles > 0:
+        max_cycles -= 1
+        # 1) Ensure L2 for senior pairs, then drop them from L1 (they already are not in L1; we only generate L2)
+        if senior_pairs_ids:
+            created = ensure_l2_for_pairs(thread_id, senior_pairs_ids, lang, now_ts)
+            if created:
+                summary_created_l2 += created
+                compaction_steps.append(f"l1_to_l2:{created}")
+            senior_pairs_ids = []
+            # refresh l2_txt from DB
+            with session_scope() as s:
+                l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
+            l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db])
+            rebuild()
+            prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
+            if not overflows(toks['total_in']):
+                break
+            continue
+        # 2) Promote oldest L2 to L3 (batch oldest few)
+        with session_scope() as s:
+            l2_old = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.asc()))
+        if l2_old:
+            ids = [x.id for x in l2_old[:5]]
+            made = promote_l2_to_l3(thread_id, ids, lang, now_ts)
+            if made:
+                summary_created_l3 += made
+                compaction_steps.append(f"l2_to_l3:{len(ids)}")
+            # refresh l2/l3 views
+            with session_scope() as s:
+                l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
+                l3_items = list(s.query(L3MicroSummary).filter(L3MicroSummary.thread_id == thread_id).order_by(L3MicroSummary.id.desc()))
+            l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db])
+            l3_txt = "\n".join([f"• {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l3_items])
+            rebuild()
+            prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
+            if not overflows(toks['total_in']):
+                break
+            continue
+        # 3) Reduce L1 tail to fallback and ensure L2 for removed
+        fallback = int(getattr(st, 'L1_TAIL_FALLBACK_PAIRS', 2))
+        if len(tail_pairs_ids) > fallback:
+            keep_ids = tail_pairs_ids[-fallback:]
+            removed_ids = tail_pairs_ids[:-fallback]
+            if removed_ids:
+                created2 = ensure_l2_for_pairs(thread_id, removed_ids, lang, now_ts)
+                if created2:
+                    summary_created_l2 += created2
+            compaction_steps.append(f"tail_reduce:{len(tail_pairs_ids)}→{fallback}")
+            # rebuild tail
+            tail_pairs_ids = keep_ids
+            # map ids back to texts
+            id_to_text = {m.id: sanitize_for_memory(m.content or '') for m in msgs}
+            l1_msgs_out.clear()
+            for (uid, aid) in tail_pairs_ids:
+                l1_msgs_out.extend(({'role': 'user', 'content': id_to_text.get(uid, '')}, {'role': 'assistant', 'content': id_to_text.get(aid, '')}))
+            # refresh l2_txt from DB
+            with session_scope() as s:
+                l2_items_db = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.desc()))
+            l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db])
+            rebuild()
+            prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
+            if not overflows(toks['total_in']):
+                break
+            continue
+        # 4) Drop tools
+        if tools_text:
+            tools_text = ''
+            compaction_steps.append("drop_tools")
+            rebuild()
+            prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
+            if not overflows(toks['total_in']):
+                break
+            continue
+        # 5) Shrink core
+        min_core = int(getattr(st, 'context_min_core_skeleton_tok', 60))
+        if approx_tokens(core_text_cur) > min_core:
+            core_text_cur = _cap_text_by_tokens(core_text_cur, min_core)
+            compaction_steps.append("shrink_core")
+            rebuild()
+            prompt_tokens_precise = preflight_and_adjust(messages_for_provider) or prompt_tokens_precise
+            if not overflows(toks['total_in']):
+                break
+            continue
+        # 6) current_user_only_mode
+        l1_msgs_out.clear(); l2_txt = ''; l3_txt = ''; tools_text = ''
+        compaction_steps.append("current_user_only_mode")
+        rebuild()
+        break
+
+    # finalize tokens and stats
+    toks = recalc_tokens()
     budget_view = { k: budgets.get(k) for k in ('C_eff','R_out','R_sys','Safety','B_total_in','B_work','core_sys_pad','core_reserved','effective_max_output_tokens') }
-    free_out_cap = max(0, int(budgets.get('C_eff', 0)) - total_in - int(budgets.get('R_sys', 0)) - int(budgets.get('Safety', 0)))
-    current_user_only_mode = False
-    original_current_user_tokens = current_user_tokens
+    free_out_cap = max(0, int(budgets.get('C_eff', 0)) - toks['total_in'] - int(budgets.get('R_sys', 0)) - int(budgets.get('Safety', 0)))
 
     def _pct(used: int, cap: int) -> int:
         return int(round(100 * used / cap)) if cap > 0 else 0
 
     stats = {
         'order': ["core","tools","l3","l2","l1"],
-        'tokens': { 'core': core_tok, 'tools': tools_tok, 'l3': l3_tok, 'l2': l2_tok, 'l1': l1_tok, 'total_in': total_in },
+        'tokens': { 'core': toks['core_tok'], 'tools': toks['tools_tok'], 'l3': toks['l3_tok'], 'l2': toks['l2_tok'], 'l1': toks['l1_tok'], 'total_in': toks['total_in'] },
         'caps':   { 'core_cap': core_cap, 'tools_cap': tools_cap, 'l1': L1_cap, 'l2': L2_cap, 'l3': L3_cap },
         'budget': budget_view,
-        'squeezes': squeezed,
-        'squeezed': bool(len(squeezed) > 0),
-        'current_user_tokens': current_user_tokens,
-        'current_user_only_mode': current_user_only_mode,
-        'original_current_user_tokens': original_current_user_tokens,
+        'squeezes': [],
+        'squeezed': False,
+        'current_user_tokens': toks['current_user_tokens'],
+        'current_user_only_mode': ('current_user_only_mode' in compaction_steps),
+        'original_current_user_tokens': toks['current_user_tokens'],
         'free_out_cap': free_out_cap,
         'l1_order': 'chronological',
+        'tail_pairs': len(tail_pairs_ids),
+        'compaction_steps': compaction_steps,
+        'summary_created': {'l2': summary_created_l2, 'l3': summary_created_l3},
     }
     stats["fill_pct"] = {
         "l1": _pct(stats["tokens"]["l1"], stats["caps"]["l1"]),
@@ -233,13 +328,14 @@ async def assemble_context(
         "l2": 100 - stats["fill_pct"]["l2"],
         "l3": 100 - stats["fill_pct"]["l3"],
     }
+    if prompt_tokens_precise is not None:
+        stats['prompt_tokens_precise'] = int(prompt_tokens_precise)
+        stats['token_count_mode'] = token_count_mode or 'proxy'
+
     last_assistant = next((m for m in reversed(l1_msgs_out) if m["role"]=="assistant"), None)
     if last_assistant:
         prev = (last_assistant.get("content") or "")[:160]
-        stats["last_assistant_before_user"] = {
-            "message_id": last_assistant.get("id"),
-            "preview": prev
-        }
+        stats["last_assistant_before_user"] = {"message_id": last_assistant.get("id"), "preview": prev}
     else:
         stats["last_assistant_before_user"] = None
 
