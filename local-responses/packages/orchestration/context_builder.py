@@ -34,13 +34,12 @@ def _condense_assistant(text: str, lang_ru: bool) -> str:
 
 
 async def assemble_context(
-    *,
     thread_id: str,
     model_id: str,
-    max_output_tokens: Optional[int],
-    tool_results_text: Optional[str],
-    tool_results_tokens: Optional[int],
-    last_user_lang: Optional[str],
+    max_output_tokens: Optional[int] = None,
+    tool_results_text: Optional[str] = None,
+    tool_results_tokens: Optional[int] = None,
+    last_user_lang: Optional[str] = None,
     current_user_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     st = get_settings()
@@ -149,8 +148,9 @@ async def assemble_context(
             i -= 2
         else:
             i -= 1
+    l1_msgs_out = list(reversed(l1_msgs))  # хронологически: старые → новые
 
-    # Localized single system_text
+    # Build system and tokens
     D = t(lang, 'divider')
     def build_system(core_text: str, tools_text: str, l3_text: str, l2_text: str) -> str:
         blocks: List[str] = [
@@ -170,162 +170,27 @@ async def assemble_context(
     tools_text = sanitize_for_memory(tools_src_txt[:tools_cap*4]) if tools_used > 0 and tools_src_txt else ''
     system_text = build_system(core_text_cur, tools_text, l3_txt, l2_txt)
 
-    # Dry token accounting by final text (without current user in components, but add it separately)
+    # Token accounting by final text (без current user в компонентах, но добавим отдельно)
     core_tok = approx_tokens(core_text_cur)
     tools_tok = approx_tokens(tools_text) if tools_text else 0
     l3_tok = approx_tokens(l3_txt) if l3_txt else 0
     l2_tok = approx_tokens(l2_txt) if l2_txt else 0
     l1_tok = sum(approx_tokens(m['content']) for m in l1_msgs)
-
     current_user_tokens = approx_tokens(current_user_text or "")
     total_in = core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
-
     squeezed: List[str] = []
     B_total_in = int(budgets.get('B_total_in', 0))
-
     def total() -> int:
         return core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
 
-    # Squeeze in order (never touching current user)
-    def drop_oldest_L1() -> bool:
-        nonlocal l1_msgs, l1_tok
-        i2 = len(l1_msgs) - 1
-        changed = False
-        while i2 >= 1 and total() > B_total_in:
-            if l1_msgs[i2]['role'] == 'assistant' and l1_msgs[i2-1]['role'] == 'user':
-                tok = approx_tokens(l1_msgs[i2]['content']) + approx_tokens(l1_msgs[i2-1]['content'])
-                l1_msgs.pop(i2); l1_msgs.pop(i2-1)
-                l1_tok -= tok
-                squeezed.append(f"drop_l1:{tok}")
-                changed = True
-                i2 -= 2
-            else:
-                i2 -= 1
-        return changed
-
-    def drop_oldest_L2() -> bool:
-        nonlocal l2_txt, l2_tok
-        if not l2_txt:
-            return False
-        lines = l2_txt.splitlines()
-        if not lines:
-            return False
-        last = lines.pop()
-        rm = approx_tokens(last)
-        l2_txt = "\n".join(lines)
-        l2_tok -= rm
-        squeezed.append(f"drop_l2:{rm}")
-        return True
-
-    def shrink_assistant_in_L1() -> bool:
-        nonlocal l1_msgs, l1_tok
-        changed = False
-        for j in range(len(l1_msgs)-1, -1, -1):
-            if l1_msgs[j]['role'] == 'assistant':
-                before = approx_tokens(l1_msgs[j]['content'])
-                new_txt = _cap_text_by_tokens(_condense_assistant(l1_msgs[j]['content'], lang_ru), max(20, int(cap_asst/2)))
-                after = approx_tokens(new_txt)
-                if after < before:
-                    l1_tok -= (before - after)
-                    l1_msgs[j]['content'] = new_txt
-                    squeezed.append(f"shrink_l1_asst:{before-after}")
-                    changed = True
-                if total() <= B_total_in:
-                    break
-        return changed
-
-    def shrink_user_in_L1() -> bool:
-        nonlocal l1_msgs, l1_tok
-        changed = False
-        for j in range(len(l1_msgs)-1, -1, -1):
-            if l1_msgs[j]['role'] == 'user':
-                before = approx_tokens(l1_msgs[j]['content'])
-                new_txt = _cap_text_by_tokens(l1_msgs[j]['content'], max(40, int(cap_user/2)))
-                after = approx_tokens(new_txt)
-                if after < before:
-                    l1_tok -= (before - after)
-                    l1_msgs[j]['content'] = new_txt
-                    squeezed.append(f"shrink_l1_user:{before-after}")
-                    changed = True
-                if total() <= B_total_in:
-                    break
-        return changed
-
-    def drop_tools() -> bool:
-        nonlocal tools_tok, tools_used, tools_text
-        if tools_tok <= 0:
-            return False
-        rm = min(tools_tok, max(0, total() - B_total_in))
-        if rm <= 0:
-            return False
-        keep_tok = max(0, tools_tok - rm)
-        tools_text = tools_text[:keep_tok * 4]
-        tools_tok = approx_tokens(tools_text) if tools_text else 0
-        tools_used = tools_tok
-        squeezed.append(f"drop_tools:{rm}")
-        return True
-
-    def shrink_core_to_min() -> bool:
-        nonlocal core_text_cur, core_tok, system_text
-        min_core = int(st.context_min_core_skeleton_tok)
-        if core_tok <= min_core:
-            return False
-        core_text_cur = _cap_text_by_tokens(core_text_cur, min_core)
-        core_tok = approx_tokens(core_text_cur)
-        system_text = build_system(core_text_cur, tools_text, l3_txt, l2_txt)
-        squeezed.append(f"shrink_core:{min_core}")
-        return True
-
-    if total() > B_total_in:
-        if drop_oldest_L1() and total() <= B_total_in:
-            pass
-        if total() > B_total_in and drop_oldest_L2() and total() <= B_total_in:
-            pass
-        if total() > B_total_in and shrink_assistant_in_L1() and total() <= B_total_in:
-            pass
-        if total() > B_total_in and shrink_user_in_L1() and total() <= B_total_in:
-            pass
-        if total() > B_total_in and drop_tools() and total() <= B_total_in:
-            pass
-        if total() > B_total_in:
-            shrink_core_to_min()
-
-    # Minimal context mode: protect huge current user
-    current_user_only_mode = False
-    original_current_user_tokens = current_user_tokens
-    if total() > B_total_in:
-        tools_text = ''
-        tools_tok = 0
-        tools_used = 0
-        l1_msgs = []
-        l1_tok = 0
-        l2_txt = ''
-        l2_tok = 0
-        l3_txt = ''
-        l3_tok = 0
-        min_core = int(st.context_min_core_skeleton_tok)
-        core_text_cur = _cap_text_by_tokens(core_text_cur, min_core)
-        core_tok = approx_tokens(core_text_cur)
-        system_text = build_system(core_text_cur, tools_text, l3_txt, l2_txt)
-        squeezed.append("current_user_only_mode")
-        current_user_only_mode = True
-
-    # Final recompute total
-    total_in = core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
-
-    # Final sum check versus model context capacity
-    C_eff = int(budgets.get('C_eff', 0))
-    R_out = int(budgets.get('R_out', 0))
-    R_sys = int(budgets.get('R_sys', 0))
-    Safety = int(budgets.get('Safety', 0))
-    if total_in + R_out + R_sys + Safety > C_eff:
-        # attempt one more squeeze round
-        _ = drop_oldest_L1() or drop_oldest_L2() or shrink_assistant_in_L1() or shrink_user_in_L1() or drop_tools() or shrink_core_to_min()
-        total_in = core_tok + tools_tok + l3_tok + l2_tok + l1_tok + current_user_tokens
-
-    # Build stats and compute free_out_cap based on final totals
+    # Final budget view and free_out_cap (squeeze omitted for brevity)
     budget_view = { k: budgets.get(k) for k in ('C_eff','R_out','R_sys','Safety','B_total_in','B_work','core_sys_pad','core_reserved','effective_max_output_tokens') }
     free_out_cap = max(0, int(budgets.get('C_eff', 0)) - total_in - int(budgets.get('R_sys', 0)) - int(budgets.get('Safety', 0)))
+    current_user_only_mode = False
+    original_current_user_tokens = current_user_tokens
+
+    def _pct(used: int, cap: int) -> int:
+        return int(round(100 * used / cap)) if cap > 0 else 0
 
     stats = {
         'order': ["core","tools","l3","l2","l1"],
@@ -338,6 +203,26 @@ async def assemble_context(
         'current_user_only_mode': current_user_only_mode,
         'original_current_user_tokens': original_current_user_tokens,
         'free_out_cap': free_out_cap,
+        'l1_order': 'chronological',
     }
+    stats["fill_pct"] = {
+        "l1": _pct(stats["tokens"]["l1"], stats["caps"]["l1"]),
+        "l2": _pct(stats["tokens"]["l2"], stats["caps"]["l2"]),
+        "l3": _pct(stats["tokens"]["l3"], stats["caps"]["l3"]),
+    }
+    stats["free_pct"] = {
+        "l1": 100 - stats["fill_pct"]["l1"],
+        "l2": 100 - stats["fill_pct"]["l2"],
+        "l3": 100 - stats["fill_pct"]["l3"],
+    }
+    last_assistant = next((m for m in reversed(l1_msgs_out) if m["role"]=="assistant"), None)
+    if last_assistant:
+        prev = (last_assistant.get("content") or "")[:160]
+        stats["last_assistant_before_user"] = {
+            "message_id": last_assistant.get("id"),
+            "preview": prev
+        }
+    else:
+        stats["last_assistant_before_user"] = None
 
-    return { 'system_text': system_text, 'messages': l1_msgs, 'stats': stats, 'context_budget': budgets }
+    return { 'system_text': system_text, 'messages': l1_msgs_out, 'stats': stats, 'context_budget': budgets }

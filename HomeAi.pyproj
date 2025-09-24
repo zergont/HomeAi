@@ -69,7 +69,9 @@
     <Compile Include="local-responses\tests\test_context_lang_follow.py" />
     <Compile Include="local-responses\tests\test_cost_usage.py" />
     <Compile Include="local-responses\tests\test_current_user_protection.py" />
+    <Compile Include="local-responses\tests\test_get_messages_since_fallback.py" />
     <Compile Include="local-responses\tests\test_health.py" />
+    <Compile Include="local-responses\tests\test_l1_ordering.py" />
     <Compile Include="local-responses\tests\test_memory_in_responses.py" />
     <Compile Include="local-responses\tests\test_memory_levels.py" />
     <Compile Include="local-responses\tests\test_model_context_endpoint.py" />

@@ -40,6 +40,17 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const ctxAsm = lastMeta?.data?.metadata?.context_assembly
   const order: string[] = Array.isArray(ctxAsm?.order) ? ctxAsm.order : ["core", "tools", "l3", "l2", "l1"]
 
+  // Memory levels progress bars
+  const fillPct = ctxAsm?.fill_pct || {}
+  const tokens = ctxAsm?.tokens || {}
+  const caps = ctxAsm?.caps || {}
+  const memLevels = ["l1", "l2", "l3"]
+  const barColor = (pct: number) =>
+    pct > 85 ? "bg-red-400" : pct > 50 ? "bg-yellow-400" : "bg-gray-300"
+
+  // Last assistant before user
+  const lastAsst = ctxAsm?.last_assistant_before_user
+
   const renderEvent = (e: Ev, i: number) => {
     const badge = (txt: string, cls: string) => (
       <span className={`inline-block text-[10px] px-2 py-0.5 rounded ${cls}`}>{txt}</span>
@@ -186,46 +197,74 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
             </div>
           )}
           {ctxAsm && (
-            <div>
-              <div className="text-gray-600 mb-1">context_assembly</div>
-              <Section title="order">
-                <div className="flex flex-wrap gap-1">
-                  {order.map((o) => (
-                    <span key={o} className="px-2 py-0.5 rounded bg-gray-100">{o}</span>
-                  ))}
-                </div>
-              </Section>
-              <Section title="tokens">
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                  {(Object.entries(ctxAsm.tokens || {}) as [string, any][]).map(([k, v]) => (
-                    <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
-                  ))}
-                </div>
-              </Section>
-              <Section title="caps">
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                  {(Object.entries(ctxAsm.caps || {}) as [string, any][]).map(([k, v]) => (
-                    <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
-                  ))}
-                </div>
-              </Section>
-              <Section title="squeezes">
-                {Array.isArray(ctxAsm.squeezes) && ctxAsm.squeezes.length > 0 ? (
-                  <ul className="list-disc pl-5">
-                    {ctxAsm.squeezes.map((s: string, i: number) => (
-                      <li key={i}>{s}</li>
+            <>
+              <div>
+                <div className="text-gray-600 mb-1">context_assembly</div>
+                <Section title="order">
+                  <div className="flex flex-wrap gap-1">
+                    {order.map((o) => (
+                      <span key={o} className="px-2 py-0.5 rounded bg-gray-100">{o}</span>
                     ))}
-                  </ul>
+                  </div>
+                </Section>
+                <Section title="tokens">
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                    {(Object.entries(ctxAsm.tokens || {}) as [string, any][]).map(([k, v]) => (
+                      <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
+                    ))}
+                  </div>
+                </Section>
+                <Section title="caps">
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                    {(Object.entries(ctxAsm.caps || {}) as [string, any][]).map(([k, v]) => (
+                      <div key={k} className="rounded bg-gray-50 px-2 py-1"><span className="text-gray-500">{k}</span>: {String(v)}</div>
+                    ))}
+                  </div>
+                </Section>
+                <Section title="squeezes">
+                  {Array.isArray(ctxAsm.squeezes) && ctxAsm.squeezes.length > 0 ? (
+                    <ul className="list-disc pl-5">
+                      {ctxAsm.squeezes.map((s: string, i: number) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <span className="text-gray-500">—</span>
+                  )}
+                </Section>
+                {(typeof ctxAsm.squeezed === 'boolean' || typeof ctxAsm.current_user_only_mode === 'boolean') && (
+                  <div className="mt-1 text-gray-700">
+                    squeezed: {String(ctxAsm.squeezed)}; current_user_only_mode: {String(ctxAsm.current_user_only_mode)}
+                  </div>
+                )}
+              </div>
+              <Section title="Memory levels">
+                {memLevels.map(lvl => (
+                  <div key={lvl} className="mb-1">
+                    <div className="flex items-center gap-2">
+                      <span className="w-8 uppercase">{lvl}</span>
+                      <div className="flex-1 h-3 rounded bg-gray-200 overflow-hidden">
+                        <div
+                          className={`h-3 ${barColor(fillPct[lvl] || 0)}`}
+                          style={{ width: `${fillPct[lvl] || 0}%` }}
+                        />
+                      </div>
+                      <span className="ml-2">{tokens[lvl] || 0}/{caps[lvl] || 0} ток. — {fillPct[lvl] || 0}%</span>
+                    </div>
+                  </div>
+                ))}
+              </Section>
+              <Section title="Last assistant before user">
+                {lastAsst?.preview ? (
+                  <div className="border rounded bg-gray-50 px-2 py-1 text-xs">
+                    <span className="text-gray-500 mr-2">Preview:</span>
+                    <span className="font-mono">{lastAsst.preview}</span>
+                  </div>
                 ) : (
-                  <span className="text-gray-500">—</span>
+                  <span className="text-gray-400">нет данных</span>
                 )}
               </Section>
-              {(typeof ctxAsm.squeezed === 'boolean' || typeof ctxAsm.current_user_only_mode === 'boolean') && (
-                <div className="mt-1 text-gray-700">
-                  squeezed: {String(ctxAsm.squeezed)}; current_user_only_mode: {String(ctxAsm.current_user_only_mode)}
-                </div>
-              )}
-            </div>
+            </>
           )}
           {lastMeta?.data?.metadata?.retry && (
             <div className="mt-2 text-blue-700">Retry: {JSON.stringify(lastMeta.data.metadata.retry)}</div>

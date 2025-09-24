@@ -220,20 +220,26 @@ def get_or_create_memory_state(thread_id: str) -> MemoryState:
         return st
 
 
-def get_messages_since(thread_id: str, last_id: Optional[str]) -> List[Message]:
+def get_messages_since(thread_id: str, last_id: Optional[str]) -> list:
     with session_scope() as s:
-        q = s.query(Message).filter(Message.thread_id == thread_id).order_by(Message.created_at.asc())
-        items = list(q)
-        out: List[Message] = []
-        seen = last_id is None
-        for m in items:
-            if not seen:
-                if m.id == last_id:
-                    seen = True
-                continue
-            # include only user/assistant
+        items = list(s.query(Message).filter(Message.thread_id == thread_id)
+                           .order_by(Message.created_at.asc()))
+        out: list = []
+        if last_id is None:
+            seq = items
+        else:
+            found = False
+            seq = []
+            for m in items:
+                if not found:
+                    if m.id == last_id:
+                        found = True
+                    continue
+                seq.append(m)
+            if not found:
+                seq = items  # fallback: не нашли last_id → берём все
+        for m in seq:
             if m.role in ("user", "assistant"):
-                # sanitize content
                 m.content = redact_fragment(m.content or "")
                 out.append(m)
         return out
