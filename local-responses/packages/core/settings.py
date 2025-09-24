@@ -61,6 +61,7 @@ class AppSettings(BaseSettings):
     default_summary_model: str = Field(default="qwen2.5-instruct", validation_alias="DEFAULT_SUMMARY_MODEL")
     summary_max_chars: int = Field(default=900, validation_alias="SUMMARY_MAX_CHARS")
     summary_debounce_sec: int = Field(default=300, validation_alias="SUMMARY_DEBOUNCE_SEC")
+    SUMMARY_GEN_MAX_TOKENS: int = Field(default=512, validation_alias="SUMMARY_GEN_MAX_TOKENS")
 
     # Pricing overrides
     price_per_1k_default: float = Field(default=0.0, validation_alias="PRICE_PER_1K_DEFAULT")

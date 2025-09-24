@@ -23,49 +23,39 @@ async def summarize_pair_to_l2(user_text: str, assistant_text: str, lang: str) -
     s = get_settings()
     provider = get_lmstudio_provider()
     system = (
-        "Суммируй диалоговую пару кратко, в 1-3 пунктах. Без лишней воды."
+        "Суммируй диалоговую пару кратко, в 1–3 строках, тезисно, без воды."
         if lang == "ru"
-        else "Summarize the user→assistant pair briefly in 1-3 bullet points."
+        else "Summarize the user→assistant pair in 1–3 short lines, concise, no fluff."
     )
-    user = f"User:\n{user_text}\n\nAssistant:\n{assistant_text}\n\n" + ("Сделай конспективно, по делу." if lang == "ru" else "Be concise, to the point.")
-    try:
-        text, _ = await provider.generate(
-            system=system,
-            user=user,
-            model=s.default_summary_model,
-            temperature=0.2,
-            max_tokens=300,
-        )
-        return redact_fragment(text)
-    except Exception:
-        # fallback: naive bullet
-        u = (user_text or "").strip().splitlines()[0][:200]
-        a = (assistant_text or "").strip().splitlines()[0][:200]
-        return f"- {u} → {a}"
+    user = f"User:\n{user_text}\n\nAssistant:\n{assistant_text}\n\n" + ("Ключевые числа/итоги, будь краток." if lang == "ru" else "Key numbers/outcome, be brief.")
+    text, _ = await provider.generate(
+        system=system,
+        user=user,
+        model=s.default_summary_model,
+        temperature=0.2,
+        max_tokens=s.SUMMARY_GEN_MAX_TOKENS,
+    )
+    return redact_fragment(text)
 
 
 async def summarize_l2_block_to_l3(l2_texts: List[str], lang: str) -> str:
     s = get_settings()
     provider = get_lmstudio_provider()
     system = (
-        "Сверни итоги L2 в микро-тезисы (каждый одной строкой)."
+        "Сверни L2-итоги в 1–2 микро-тезиса (по одной строке), без воды."
         if lang == "ru"
-        else "Condense L2 items into single-line micro-theses."
+        else "Condense L2 items into 1–2 single-line micro-theses, no fluff."
     )
     joined = "\n".join(l2_texts)
-    user = joined + ("\n\nСделай очень кратко." if lang == "ru" else "\n\nMake it very concise.")
-    try:
-        text, _ = await provider.generate(
-            system=system,
-            user=user,
-            model=s.default_summary_model,
-            temperature=0.2,
-            max_tokens=256,
-        )
-        return redact_fragment(text)
-    except Exception:
-        bullets = [f"• {t.splitlines()[0][:200]}" for t in l2_texts]
-        return "\n".join(bullets)
+    user = joined
+    text, _ = await provider.generate(
+        system=system,
+        user=user,
+        model=s.default_summary_model,
+        temperature=0.2,
+        max_tokens=min(s.SUMMARY_GEN_MAX_TOKENS, 256),
+    )
+    return redact_fragment(text)
 
 
 def _detect_lang(messages: List[Dict[str, str]]) -> Optional[str]:

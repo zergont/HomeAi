@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, UTC
 from decimal import Decimal
 from typing import Any, Dict, Optional, List, Tuple
+import asyncio
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -323,6 +324,15 @@ def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str,
     """pairs: list of (user_msg_id, assistant_msg_id). Create L2 if absent for each pair.
     Returns number of L2 created."""
     created = 0
+    from packages.orchestration import summarizer  # local import to avoid cycles
+    from packages.orchestration.redactor import sanitize_for_memory
+
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+
     with session_scope() as s:
         for (uid, aid) in pairs:
             exists = s.query(L2Summary).filter(
@@ -332,24 +342,23 @@ def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str,
             ).first()
             if exists:
                 continue
-            um = s.get(Message, uid)
-            am = s.get(Message, aid)
+            um = s.get(Message, uid); am = s.get(Message, aid)
             if not um or not am:
                 continue
-            # naive concise summary: 1-3 lines, key points
-            u_short = (um.content or '').strip().splitlines()[0][:200]
-            a_short = (am.content or '').strip().splitlines()[0][:200]
-            lines = [f"- {u_short} → {a_short}"]
-            text = "\n".join(lines)
-            toks = approx_tokens(text)
-            rec = L2Summary(
-                thread_id=thread_id,
-                start_message_id=uid,
-                end_message_id=aid,
-                text=text,
-                tokens=toks,
-                created_at=now,
-            )
+            u_txt = sanitize_for_memory(um.content or ""); a_txt = sanitize_for_memory(am.content or "")
+            try:
+                if loop and loop.is_running():
+                    # nested loop: run in thread or simple fallback to naive
+                    l2_text = f"- {(u_txt.strip().splitlines() or [''])[0][:200]} → {(a_txt.strip().splitlines() or [''])[0][:200]}"
+                else:
+                    loop = loop or asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    l2_text = loop.run_until_complete(summarizer.summarize_pair_to_l2(u_txt, a_txt, lang or "ru"))
+            except Exception:
+                u_short = (u_txt.strip().splitlines() or [""])[0][:200]
+                a_short = (a_txt.strip().splitlines() or [""])[0][:200]
+                l2_text = f"- {u_short} → {a_short}"
+            rec = L2Summary(thread_id=thread_id, start_message_id=uid, end_message_id=aid, text=l2_text, tokens=approx_tokens(l2_text), created_at=now)
             s.add(rec)
             created += 1
     return created
@@ -359,18 +368,32 @@ def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> 
     """Create one L3 from given L2 ids (oldest-first) and delete those L2. Returns number of L3 created (0/1)."""
     if not l2_ids:
         return 0
+    from packages.orchestration import summarizer  # local import
+
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+
     with session_scope() as s:
         items = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id, L2Summary.id.in_(l2_ids)).order_by(L2Summary.id.asc()))
         if not items:
             return 0
-        bullets = [f"• {x.text.splitlines()[0][:200]}" for x in items]
-        text = "\n".join(bullets[:2])  # keep 1-2 theses
-        toks = approx_tokens(text)
-        start_id = items[0].id
-        end_id = items[-1].id
-        l3 = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=text, tokens=toks, created_at=now)
+        l2_texts = [x.text or "" for x in items]
+        try:
+            if loop and loop.is_running():
+                l3_text = "\n".join([f"• {(t.splitlines() or [''])[0][:200]}" for t in l2_texts[:2]])
+            else:
+                loop = loop or asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                l3_text = loop.run_until_complete(summarizer.summarize_l2_block_to_l3(l2_texts, lang or "ru"))
+        except Exception:
+            bullets = [f"• {(t.splitlines() or [''])[0][:200]}" for t in l2_texts]
+            l3_text = "\n".join(bullets[:2])
+        start_id = items[0].id; end_id = items[-1].id
+        l3 = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=l3_text, tokens=approx_tokens(l3_text), created_at=now)
         s.add(l3)
-        # delete promoted L2
         for x in items:
             s.delete(x)
         return 1
