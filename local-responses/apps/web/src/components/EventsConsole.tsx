@@ -22,14 +22,12 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
     }
   }, [events])
 
-  // Find the last event that actually carries metadata with context fields
   const lastMeta = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i]
       const md = e?.data?.metadata
       if (md && (md.context_budget || md.context_assembly)) return e
     }
-    // fallback: try last 'meta'
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].event === 'meta') return events[i]
     }
@@ -40,22 +38,18 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const ctxAsm = lastMeta?.data?.metadata?.context_assembly
   const order: string[] = Array.isArray(ctxAsm?.order) ? ctxAsm.order : ["core", "tools", "l3", "l2", "l1"]
 
-  // Memory levels progress bars
   const fillPct = ctxAsm?.fill_pct || {}
   const tokens = ctxAsm?.tokens || {}
   const caps = ctxAsm?.caps || {}
   const memLevels = ["l1", "l2", "l3"]
-  const barColor = (pct: number) =>
-    pct > 85 ? "bg-red-400" : pct > 50 ? "bg-yellow-400" : "bg-gray-300"
-
-  // Last assistant before user
+  const barColor = (pct: number) => pct > 85 ? "bg-red-400" : pct > 50 ? "bg-yellow-400" : "bg-gray-300"
   const lastAsst = ctxAsm?.last_assistant_before_user
-
   const freeOutCap = ctxAsm?.free_out_cap
 
-  // Derived for Tokens section (backward-compatible prompt tokens)
+  // Tokens section data
   const asm = lastMeta?.data?.metadata?.context_assembly ?? {}
   const bud = lastMeta?.data?.metadata?.context_budget ?? {}
+  const bd = asm.tokens_breakdown ?? {}
   const promptTok = typeof asm.prompt_tokens_precise === 'number'
     ? asm.prompt_tokens_precise
     : (typeof asm.prompt_tokens_estimate === 'number' ? asm.prompt_tokens_estimate : undefined)
@@ -82,7 +76,7 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
     if (e.event === 'delta' && !showDeltas) return null
 
     switch (e.event) {
-      case 'error': {
+      case 'error':
         return (
           <div key={i} className="mb-2 border rounded p-2 bg-red-50">
             {header}
@@ -91,9 +85,7 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
             {showRaw && <Raw />}
           </div>
         )
-      }
       case 'meta': {
-        const md = e.data?.metadata || {}
         const prov = e.data?.provider || {}
         return (
           <div key={i} className="mb-2 border rounded p-2 bg-white">
@@ -103,15 +95,16 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
               <span className="text-xs text-gray-700">status: {e.data?.status || 'in_progress'}</span>
               <span className="text-xs text-gray-500">model: {e.data?.model}</span>
               <span className="text-xs text-gray-500">provider: {prov?.name || ''}</span>
+              {asm?.token_count_mode && <span className="text-[10px] px-2 py-0.5 rounded bg-gray-200">{asm.token_count_mode}</span>}
             </div>
-            {md?.thread_id && (
-              <div className="text-xs text-gray-600">thread: {md.thread_id}</div>
+            {e.data?.metadata?.thread_id && (
+              <div className="text-xs text-gray-600">thread: {e.data.metadata.thread_id}</div>
             )}
             {showRaw && <Raw />}
           </div>
         )
       }
-      case 'delta': {
+      case 'delta':
         return (
           <div key={i} className="mb-1 border rounded p-2 bg-gray-50">
             {header}
@@ -119,8 +112,7 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
             {showRaw && <Raw />}
           </div>
         )
-      }
-      case 'summary': {
+      case 'summary':
         return (
           <div key={i} className="mb-2 border rounded p-2 bg-amber-50">
             {header}
@@ -129,7 +121,6 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
             {showRaw && <Raw />}
           </div>
         )
-      }
       case 'usage': {
         const u = e.data || {}
         return (
@@ -141,7 +132,7 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
           </div>
         )
       }
-      case 'done': {
+      case 'done':
         return (
           <div key={i} className="mb-2 border rounded p-2 bg-green-50">
             {header}
@@ -150,15 +141,13 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
             {showRaw && <Raw />}
           </div>
         )
-      }
-      default: {
+      default:
         return (
           <div key={i} className="mb-2 border rounded p-2 bg-white">
             {header}
             {showRaw && <Raw />}
           </div>
         )
-      }
     }
   }
 
@@ -238,21 +227,13 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                   <span className="text-gray-500">—</span>
                 )}
               </Section>
-              {(typeof ctxAsm.squeezed === 'boolean' || typeof ctxAsm.current_user_only_mode === 'boolean') && (
-                <div className="mt-1 text-gray-700">
-                  squeezed: {String(ctxAsm.squeezed)}; current_user_only_mode: {String(ctxAsm.current_user_only_mode)}
-                </div>
-              )}
               <Section title="Memory levels">
                 {memLevels.map(lvl => (
                   <div key={lvl} className="mb-1">
                     <div className="flex items-center gap-2">
                       <span className="w-8 uppercase">{lvl}</span>
                       <div className="flex-1 h-3 rounded bg-gray-200 overflow-hidden">
-                        <div
-                          className={`h-3 ${barColor(fillPct[lvl] || 0)}`}
-                          style={{ width: `${fillPct[lvl] || 0}%` }}
-                        />
+                        <div className={`h-3 ${barColor(fillPct[lvl] || 0)}`} style={{ width: `${fillPct[lvl] || 0}%` }} />
                       </div>
                       <span className="ml-2">{tokens[lvl] || 0}/{caps[lvl] || 0} ток. — {fillPct[lvl] || 0}%</span>
                     </div>
@@ -279,13 +260,24 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
               )}
             </div>
           )}
-          {(asm.token_count_mode || typeof promptTok === 'number' || typeof asm.free_out_cap === 'number' || typeof bud.effective_max_output_tokens === 'number') && (
+          {(asm.token_count_mode || bd.total || typeof promptTok === 'number' || typeof asm.free_out_cap === 'number' || typeof bud.effective_max_output_tokens === 'number') && (
             <div className="mt-3 border rounded p-2">
               <div className="font-semibold mb-1">Tokens</div>
-              {asm.token_count_mode && <div>Token count mode: <b>{asm.token_count_mode}</b></div>}
-              {typeof promptTok === 'number' && <div>Prompt tokens (SDK): <b>{promptTok}</b></div>}
+              {asm.token_count_mode && <div>Mode: <b>{asm.token_count_mode}</b></div>}
+              {typeof promptTok === 'number' && <div>Total prompt (SDK): <b>{promptTok}</b></div>}
               {typeof asm.free_out_cap === 'number' && <div>Free out cap: <b>{asm.free_out_cap}</b></div>}
               {typeof bud.effective_max_output_tokens === 'number' && <div>Max output (effective): <b>{bud.effective_max_output_tokens}</b></div>}
+              {bd.total && (
+                <div className="mt-2">
+                  <div className="opacity-70">Breakdown (tokens):</div>
+                  <div>system: {bd.system ?? 0}</div>
+                  <div>L3: {bd.l3 ?? 0}</div>
+                  <div>L2: {bd.l2 ?? 0}</div>
+                  <div>L1: {bd.l1 ?? 0}</div>
+                  <div>user: {bd.user ?? 0}</div>
+                  <div className="font-semibold">Total: {bd.total ?? 0}</div>
+                </div>
+              )}
             </div>
           )}
         </div>

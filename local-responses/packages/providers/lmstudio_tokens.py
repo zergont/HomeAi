@@ -3,13 +3,12 @@ import time, hashlib, json
 import logging
 try:
     import lmstudio as lms
-except Exception:  # optional import guard for test environments
+except Exception:
     lms = None
 
 from packages.utils.tokens import approx_tokens, approx_tokens_messages
 
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://192.168.0.111:1234")
-
 log = logging.getLogger(__name__)
 
 _cache: dict[str, dict] = {}
@@ -22,16 +21,14 @@ def _key(model: str, payload: dict) -> str:
 
 def _get_model(model_id: str):
     if lms is None:
-        raise RuntimeError("LM Studio SDK not available")
+        raise RuntimeError("LM Studio SDK not available; install 'lmstudio'")
     try:
         client = getattr(lms, "Client", None)
         if client is not None:
             cl = client(base_url=LMSTUDIO_BASE_URL)
             return cl.llm(model_id)
-    except Exception:
-        # fall through to env-based init
-        pass
-    # fallback: some SDK versions read base_url from ENV
+    except Exception as e:
+        log.warning("LMStudio Client base_url failed, falling back: %s", e)
     os.environ["LMSTUDIO_BASE_URL"] = LMSTUDIO_BASE_URL
     return lms.llm(model_id)
 

@@ -397,3 +397,44 @@ def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> 
         for x in items:
             s.delete(x)
         return 1
+
+def insert_l2_summary(thread_id: str, start_msg_id: str, end_msg_id: str, text: str, now: int):
+    from packages.utils.tokens import approx_tokens
+    with session_scope() as s:
+        rec = L2Summary(thread_id=thread_id, start_message_id=start_msg_id, end_message_id=end_msg_id, text=text, tokens=approx_tokens(text), created_at=now)
+        s.add(rec)
+        return rec
+
+def pick_oldest_l2_block(thread_id: str, max_items: int = 5):
+    with session_scope() as s:
+        q = s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.asc()).limit(max_items)
+        return list(q)
+
+def insert_l3_summary(thread_id: str, l2_ids: list[int], text: str, now: int):
+    from packages.utils.tokens import approx_tokens
+    if not l2_ids:
+        return None
+    with session_scope() as s:
+        start_id = min(l2_ids); end_id = max(l2_ids)
+        rec = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=text, tokens=approx_tokens(text), created_at=now)
+        s.add(rec)
+        return rec
+
+def delete_l2_batch(l2_ids: list[int]):
+    if not l2_ids:
+        return 0
+    with session_scope() as s:
+        cnt = 0
+        for _id in l2_ids:
+            row = s.get(L2Summary, _id)
+            if row:
+                s.delete(row); cnt += 1
+        return cnt
+
+def evict_l3_oldest(thread_id: str, count: int = 3) -> int:
+    with session_scope() as s:
+        q = s.query(L3MicroSummary).filter(L3MicroSummary.thread_id == thread_id).order_by(L3MicroSummary.id.asc()).limit(count)
+        items = list(q)
+        for it in items:
+            s.delete(it)
+        return len(items)

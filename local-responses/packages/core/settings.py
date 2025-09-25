@@ -39,7 +39,7 @@ class AppSettings(BaseSettings):
     ctx_core_sys_pad_tok: int = Field(default=100, validation_alias="CTX_CORE_SYS_PAD_TOK")
     context_min_core_skeleton_tok: int = Field(default=60, validation_alias="CONTEXT_MIN_CORE_SKELETON_TOK")
 
-    # Memory L1/L2/L3 settings
+    # Memory L1/L2/L3 settings (shares used by budget computation)
     mem_l1_share: float = Field(default=0.60, validation_alias="MEM_L1_SHARE")
     mem_l2_share: float = Field(default=0.30, validation_alias="MEM_L2_SHARE")
     mem_l3_share: float = Field(default=0.10, validation_alias="MEM_L3_SHARE")
@@ -50,7 +50,7 @@ class AppSettings(BaseSettings):
     cap_tok_assistant: int = Field(default=80, validation_alias="CAP_TOK_ASSISTANT")
     lang_follows_last_user: bool = Field(default=True, validation_alias="LANG_FOLLOWS_LAST_USER")
 
-    # Summarizer
+    # Summarizer / autosummary
     summary_trigger_tokens: int = Field(default=100, validation_alias="SUMMARY_TRIGGER_TOKENS")
     summary_system_prompt: str = Field(
         default="Суммируй диалог кратко, по фактам, без рассуждений. "
@@ -68,13 +68,25 @@ class AppSettings(BaseSettings):
     price_overrides: Dict[str, float] = Field(default_factory=dict)
 
     # Token counting proxy
-    TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")
+    TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")  # "proxy"|"approx"|"provider_usage"
     TOKEN_CACHE_TTL_SEC: int = Field(default=300, validation_alias="TOKEN_CACHE_TTL_SEC")
 
-    # New L1 tail behavior and compaction flags
-    L1_TAIL_UNCLIPPED_PAIRS: int = Field(default=4, validation_alias="L1_TAIL_UNCLIPPED_PAIRS")
-    L1_TAIL_FALLBACK_PAIRS: int = Field(default=2, validation_alias="L1_TAIL_FALLBACK_PAIRS")
+    # L1 invariants / compaction policy
+    L1_TAIL_MIN_PAIRS: int = Field(default=4, validation_alias="L1_TAIL_MIN_PAIRS")
+    L1_TAIL_EMERGENCY_PAIRS: int = Field(default=2, validation_alias="L1_TAIL_EMERGENCY_PAIRS")
     SUMMARIZE_INSTEAD_OF_TRIM: bool = Field(default=True, validation_alias="SUMMARIZE_INSTEAD_OF_TRIM")
+
+    # High / Low watermarks (percent fill against caps)
+    L1_HIGH: int = Field(default=90, validation_alias="L1_HIGH")
+    L1_LOW: int = Field(default=70, validation_alias="L1_LOW")
+    L2_HIGH: int = Field(default=90, validation_alias="L2_HIGH")
+    L2_LOW: int = Field(default=70, validation_alias="L2_LOW")
+    L3_HIGH: int = Field(default=90, validation_alias="L3_HIGH")
+    L3_LOW: int = Field(default=70, validation_alias="L3_LOW")
+
+    # Output / safety invariants
+    R_OUT_MIN: int = Field(default=256, validation_alias="R_OUT_MIN")  # desired minimal free output tokens
+    SAFETY_TOK: int = Field(default=64, validation_alias="SAFETY_TOK")  # fixed safety reserve
 
     @property
     def db_dialect(self) -> str:

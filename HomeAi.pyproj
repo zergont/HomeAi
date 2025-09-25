@@ -38,6 +38,7 @@
     <Compile Include="local-responses\packages\core\logging.py" />
     <Compile Include="local-responses\packages\core\pricing.py" />
     <Compile Include="local-responses\packages\core\settings.py" />
+    <Compile Include="local-responses\packages\orchestration\after_reply.py" />
     <Compile Include="local-responses\packages\orchestration\budget.py" />
     <Compile Include="local-responses\packages\orchestration\context_builder.py" />
     <Compile Include="local-responses\packages\orchestration\context_manager.py" />
@@ -46,6 +47,7 @@
     <Compile Include="local-responses\packages\orchestration\retry_policy.py" />
     <Compile Include="local-responses\packages\orchestration\stream_handlers.py" />
     <Compile Include="local-responses\packages\orchestration\summarizer.py" />
+    <Compile Include="local-responses\packages\orchestration\token_budget.py" />
     <Compile Include="local-responses\packages\orchestration\tool_runtime.py" />
     <Compile Include="local-responses\packages\providers\base.py" />
     <Compile Include="local-responses\packages\providers\lmstudio.py" />
