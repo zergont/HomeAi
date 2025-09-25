@@ -42,6 +42,7 @@ from packages.storage.repo import (
     session_scope,
     get_profile as repo_get_profile,
     save_profile as repo_save_profile,
+    get_thread_messages_for_l1,
 )
 from packages.storage.models import Message, Thread
 from packages.utils.tokens import approx_tokens, profile_text_view, approx_tokens_messages
@@ -483,12 +484,12 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     price_1k = price_for("lmstudio", provider_model, settings.price_overrides) or settings.price_per_1k_default
 
     thread_id = _ensure_thread(req)
-    ctx = build_context(thread_id)
 
-    attempt_id = str(uuid.uuid4())
-    now = int(time.time())
-    tool_runtime = ToolRuntime(thread_id, attempt_id, now, settings)
-    assembler = ToolCallAssembler()
+    # Save user message early for pairing and UI echo
+    saved_user = append_message(thread_id, "user", req.input)
+    current_user_id = saved_user.id if saved_user else None
+
+    # streaming early echo will be handled in stream branch
 
     assembled = await assemble_context(
         thread_id=thread_id,
@@ -519,6 +520,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
     # metadata base
     metadata = {"context_budget": assembled.get("context_budget"), "context_assembly": assembled.get("stats", {})}
+    metadata["context_assembly"]["l1_pairs_count"] = assembled.get("stats", {}).get("l1_pairs_count", 0)
     metadata["context_assembly"]["token_count_mode"] = token_mode
     metadata["context_assembly"]["prompt_tokens_precise"] = int(prompt_tok)
     metadata["context_assembly"]["free_out_cap"] = int(free_out)
@@ -642,7 +644,9 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
         async def produce_loop():
             nonlocal last_delta_ts
-            # First meta with preflight results
+            # First send user echo
+            await queue.put(await _sse_format("message", {"role":"user","content": redact_fragment(req.input), "message_id": current_user_id, "thread_id": thread_id}))
+            # Then meta
             meta_payload = {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id, "context_budget": metadata["context_budget"], "context_assembly": metadata["context_assembly"], "provider_request": provider_request}}
             await send_sse_meta(queue, meta_payload)
             try:

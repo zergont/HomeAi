@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from packages.core.settings import get_settings
 from packages.orchestration.budget import compute_budgets
 from packages.orchestration.redactor import sanitize_for_memory
-from packages.storage.repo import get_profile, session_scope
+from packages.storage.repo import get_profile, session_scope, get_thread_messages_for_l1
 from packages.storage.models import L2Summary, L3MicroSummary, Message
 from packages.utils.tokens import approx_tokens, profile_text_view
 from packages.utils.i18n import pick_lang, t
@@ -98,9 +98,10 @@ async def assemble_context(
     l3_txt = "\n".join([f"• {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l3_items_db]) if l3_items_db else ''
     l2_txt = "\n".join([f"- {sanitize_for_memory(x.text or '').splitlines()[0][:200]}" for x in l2_items_db]) if l2_items_db else ''
 
-    # Full message history ASC (user/assistant) for pairing
-    with session_scope() as s:
-        history_msgs = [m for m in s.query(Message).filter(Message.thread_id == thread_id).order_by(Message.created_at.asc()) if m.role in ("user","assistant")]
+    # Full message history ASC (user/assistant) for pairing (exclude current user if id passed via budgets maybe later)
+    # Replaced previous history acquisition with full-history function
+    # NOTE: current_user_text not yet inserted into DB when assembling; if needed pass exclude id.
+    history_msgs = get_thread_messages_for_l1(thread_id, exclude_message_id=None, max_items=2000)
     all_pairs = build_pairs(history_msgs)
     tail_min = int(getattr(st, 'L1_TAIL_MIN_PAIRS', 4))
     tail_n = min(tail_min, len(all_pairs))
@@ -293,6 +294,7 @@ async def assemble_context(
         'free_out_cap': free_out_cap,
         'l1_order': 'chronological',
         'tail_pairs': len(tail_pairs),
+        'l1_pairs_count': len(tail_pairs),
         'compaction_steps': compaction_steps,
         'prompt_tokens_precise': int(breakdown['total']),
         'token_count_mode': breakdown['token_count_mode'],
