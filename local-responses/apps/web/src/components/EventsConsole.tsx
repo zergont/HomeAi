@@ -43,7 +43,6 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const caps = ctxAsm?.caps || {}
   const memLevels = ["l1", "l2", "l3"]
   const barColor = (pct: number) => pct > 85 ? "bg-red-400" : pct > 50 ? "bg-yellow-400" : "bg-gray-300"
-  const lastAsst = ctxAsm?.last_assistant_before_user
   const freeOutCap = ctxAsm?.free_out_cap
 
   // Tokens section data
@@ -53,6 +52,8 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const promptTok = typeof asm.prompt_tokens_precise === 'number'
     ? asm.prompt_tokens_precise
     : (typeof asm.prompt_tokens_estimate === 'number' ? asm.prompt_tokens_estimate : undefined)
+  const sc = asm.summary_counters ?? {}
+  const inc = asm.includes ?? {}
 
   const renderEvent = (e: Ev, i: number) => {
     const badge = (txt: string, cls: string) => (
@@ -88,20 +89,20 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
       case 'meta': {
         const prov = e.data?.provider || {}
         return (
-          <div key={i} className="mb-2 border rounded p-2 bg-white">
-            {header}
-            <div className="mt-1 flex gap-2 items-center">
-              {badge('META', 'bg-blue-600 text-white')}
-              <span className="text-xs text-gray-700">status: {e.data?.status || 'in_progress'}</span>
-              <span className="text-xs text-gray-500">model: {e.data?.model}</span>
-              <span className="text-xs text-gray-500">provider: {prov?.name || ''}</span>
-              {asm?.token_count_mode && <span className="text-[10px] px-2 py-0.5 rounded bg-gray-200">{asm.token_count_mode}</span>}
+            <div key={i} className="mb-2 border rounded p-2 bg-white">
+              {header}
+              <div className="mt-1 flex gap-2 items-center">
+                {badge('META', 'bg-blue-600 text-white')}
+                <span className="text-xs text-gray-700">status: {e.data?.status || 'in_progress'}</span>
+                <span className="text-xs text-gray-500">model: {e.data?.model}</span>
+                <span className="text-xs text-gray-500">provider: {prov?.name || ''}</span>
+                {asm?.token_count_mode && <span className="text-[10px] px-2 py-0.5 rounded bg-gray-200">{asm.token_count_mode}</span>}
+              </div>
+              {e.data?.metadata?.thread_id && (
+                <div className="text-xs text-gray-600">thread: {e.data.metadata.thread_id}</div>
+              )}
+              {showRaw && <Raw />}
             </div>
-            {e.data?.metadata?.thread_id && (
-              <div className="text-xs text-gray-600">thread: {e.data.metadata.thread_id}</div>
-            )}
-            {showRaw && <Raw />}
-          </div>
         )
       }
       case 'delta':
@@ -241,6 +242,21 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                 ))}
                 <div className="text-[11px] text-gray-500 mt-1">L1 — последние пары без сжатия</div>
               </Section>
+              {typeof asm.l1_pairs_count === 'number' && (
+                <div className="mt-2 border rounded p-2 bg-gray-50">
+                  <div className="font-semibold">L1 (fill-to-cap)</div>
+                  <div>Pairs in L1: <b>{asm.l1_pairs_count}</b></div>
+                  {Array.isArray(inc.l1_pairs) && inc.l1_pairs.length > 0 && (
+                    <div className="text-xs opacity-80 break-all">IDs: {inc.l1_pairs.map((p:any)=>`${p.u}→${p.a}`).join(', ')}</div>
+                  )}
+                  {(sc.l1_to_l2 || sc.l2_to_l3) && (
+                    <div className="mt-1">
+                      <span>L1→L2: <b>{sc.l1_to_l2 ?? 0}</b></span>
+                      <span className="ml-3">L2→L3: <b>{sc.l2_to_l3 ?? 0}</b></span>
+                    </div>
+                  )}
+                </div>
+              )}
               {ctxAsm?.summary_created && (
                 <Section title="Summaries created this request">
                   <div className="grid grid-cols-2 gap-2">
@@ -276,6 +292,21 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
                   <div>L1: {bd.l1 ?? 0}</div>
                   <div>user: {bd.user ?? 0}</div>
                   <div className="font-semibold">Total: {bd.total ?? 0}</div>
+                </div>
+              )}
+              {sc && (
+                <div className="mt-2">
+                  <div className="font-semibold">Summaries:</div>
+                  <div>L1→L2: <b>{sc.l1_to_l2 ?? 0}</b></div>
+                  <div>L2→L3: <b>{sc.l2_to_l3 ?? 0}</b></div>
+                </div>
+              )}
+              {inc && (
+                <div className="mt-2">
+                  <div className="font-semibold">Payload contains:</div>
+                  <div>L3 ids: {Array.isArray(inc.l3_ids) ? inc.l3_ids.join(', ') : '—'}</div>
+                  <div>L2 pairs: {Array.isArray(inc.l2_pairs) ? inc.l2_pairs.map((p:any)=>`${p.id}[${p.u}→${p.a}]`).join(', ') : '—'}</div>
+                  <div>L1 pairs: {Array.isArray(inc.l1_pairs) ? inc.l1_pairs.map((p:any)=>`${p.u}→${p.a}`).join(', ') : '—'}</div>
                 </div>
               )}
             </div>

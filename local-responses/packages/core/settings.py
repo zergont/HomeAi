@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 
 from pydantic import AnyUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -71,10 +71,15 @@ class AppSettings(BaseSettings):
     TOKEN_COUNT_MODE: str = Field(default="proxy", validation_alias="TOKEN_COUNT_MODE")  # "proxy"|"approx"|"provider_usage"
     TOKEN_CACHE_TTL_SEC: int = Field(default=300, validation_alias="TOKEN_CACHE_TTL_SEC")
 
-    # L1 invariants / compaction policy
+    # L1 invariants / compaction policy (legacy tail)
     L1_TAIL_MIN_PAIRS: int = Field(default=4, validation_alias="L1_TAIL_MIN_PAIRS")
     L1_TAIL_EMERGENCY_PAIRS: int = Field(default=2, validation_alias="L1_TAIL_EMERGENCY_PAIRS")
     SUMMARIZE_INSTEAD_OF_TRIM: bool = Field(default=True, validation_alias="SUMMARIZE_INSTEAD_OF_TRIM")
+
+    # Dynamic L1 fill (HF-27A)
+    L1_FILL_TO_CAP: bool = Field(default=True, validation_alias="L1_FILL_TO_CAP")
+    L1_MIN_PAIRS: int = Field(default=2, validation_alias="L1_MIN_PAIRS")
+    L1_FILL_HYSTERESIS: Tuple[int, int] = Field(default=(90, 70), validation_alias="L1_FILL_HYSTERESIS")  # (High,Low) %
 
     # High / Low watermarks (percent fill against caps)
     L1_HIGH: int = Field(default=90, validation_alias="L1_HIGH")

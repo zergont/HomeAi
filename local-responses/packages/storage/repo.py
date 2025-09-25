@@ -214,11 +214,11 @@ def save_profile(data: Dict[str, Any]) -> Profile:
 
 def get_or_create_memory_state(thread_id: str) -> MemoryState:
     with session_scope() as s:
-        st = s.get(MemoryState, thread_id)
-        if st is None:
-            st = MemoryState(thread_id=thread_id, l1_tokens=0, l2_tokens=0, l3_tokens=0, updated_at=int(datetime.now(UTC).timestamp()))
-            s.add(st)
-        return st
+        st_row = s.get(MemoryState, thread_id)
+        if st_row is None:
+            st_row = MemoryState(thread_id=thread_id, l1_tokens=0, l2_tokens=0, l3_tokens=0, updated_at=int(datetime.now(UTC).timestamp()))
+            s.add(st_row)
+        return st_row
 
 
 def get_messages_since(thread_id: str, last_id: Optional[str]) -> list:
@@ -278,14 +278,14 @@ def trim_l3_if_over(thread_id: str, max_tokens: int) -> int:
 
 def update_memory_counters(thread_id: str, l1_tokens: int, l2_tokens: int, l3_tokens: int) -> None:
     with session_scope() as s:
-        st = s.get(MemoryState, thread_id)
-        if st is None:
-            st = MemoryState(thread_id=thread_id)
-        st.l1_tokens = l1_tokens
-        st.l2_tokens = l2_tokens
-        st.l3_tokens = l3_tokens
-        st.updated_at = int(datetime.now(UTC).timestamp())
-        s.add(st)
+        st_row = s.get(MemoryState, thread_id)
+        if st_row is None:
+            st_row = MemoryState(thread_id=thread_id)
+        st_row.l1_tokens = l1_tokens
+        st_row.l2_tokens = l2_tokens
+        st_row.l3_tokens = l3_tokens
+        st_row.updated_at = int(datetime.now(UTC).timestamp())
+        s.add(st_row)
 
 # Expose L2/L3 getters for context_builder if needed
 
@@ -318,21 +318,19 @@ def insert_tool_run(thread_id: str, attempt_id: str, tool_name: str, args_json: 
         s.commit()
         return run
 
-# New: On-demand summarization helpers used by compaction
+# ---------- Async summarization helpers (HF-26B) ----------
 
-def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str, now: int) -> int:
-    """pairs: list of (user_msg_id, assistant_msg_id). Create L2 if absent for each pair.
-    Returns number of L2 created."""
-    created = 0
-    from packages.orchestration import summarizer  # local import to avoid cycles
+async def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str, now: int) -> int:
+    """Create missing L2 summaries for given (user_msg_id, assistant_msg_id) pairs.
+    No event-loop blocking (pure async summarizer usage); DB ops are sync per pair."""
+    if not pairs:
+        return 0
+    from packages.orchestration import summarizer
     from packages.orchestration.redactor import sanitize_for_memory
 
-    loop = None
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-
+    created = 0
+    # Collect payloads first (texts) inside one session (without summarizing inside the session)
+    need: List[Tuple[str,str,str,str]] = []  # (u_id,a_id,u_txt,a_txt)
     with session_scope() as s:
         for (uid, aid) in pairs:
             exists = s.query(L2Summary).filter(
@@ -345,58 +343,77 @@ def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang: str,
             um = s.get(Message, uid); am = s.get(Message, aid)
             if not um or not am:
                 continue
-            u_txt = sanitize_for_memory(um.content or ""); a_txt = sanitize_for_memory(am.content or "")
-            try:
-                if loop and loop.is_running():
-                    # nested loop: run in thread or simple fallback to naive
-                    l2_text = f"- {(u_txt.strip().splitlines() or [''])[0][:200]} → {(a_txt.strip().splitlines() or [''])[0][:200]}"
-                else:
-                    loop = loop or asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    l2_text = loop.run_until_complete(summarizer.summarize_pair_to_l2(u_txt, a_txt, lang or "ru"))
-            except Exception:
-                u_short = (u_txt.strip().splitlines() or [""])[0][:200]
-                a_short = (a_txt.strip().splitlines() or [""])[0][:200]
-                l2_text = f"- {u_short} → {a_short}"
+            u_txt = sanitize_for_memory(um.content or "")
+            a_txt = sanitize_for_memory(am.content or "")
+            need.append((uid, aid, u_txt, a_txt))
+    if not need:
+        return 0
+
+    for (uid, aid, u_txt, a_txt) in need:
+        try:
+            l2_text = await summarizer.summarize_pair_to_l2(u_txt, a_txt, lang or "ru")
+        except Exception:
+            u_short = (u_txt.strip().splitlines() or [""])[0][:200]
+            a_short = (a_txt.strip().splitlines() or [""])[0][:200]
+            l2_text = f"- {u_short} → {a_short}"
+        with session_scope() as s:
+            # race check
+            exists = s.query(L2Summary).filter(
+                L2Summary.thread_id == thread_id,
+                L2Summary.start_message_id == uid,
+                L2Summary.end_message_id == aid,
+            ).first()
+            if exists:
+                continue
             rec = L2Summary(thread_id=thread_id, start_message_id=uid, end_message_id=aid, text=l2_text, tokens=approx_tokens(l2_text), created_at=now)
             s.add(rec)
             created += 1
     return created
 
-
-def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> int:
-    """Create one L3 from given L2 ids (oldest-first) and delete those L2. Returns number of L3 created (0/1)."""
+async def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> int:
     if not l2_ids:
         return 0
-    from packages.orchestration import summarizer  # local import
+    from packages.orchestration import summarizer
 
-    loop = None
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-
+    # Load items + texts first
     with session_scope() as s:
-        items = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id, L2Summary.id.in_(l2_ids)).order_by(L2Summary.id.asc()))
-        if not items:
+        items = list(s.query(L2Summary).filter(
+            L2Summary.thread_id == thread_id,
+            L2Summary.id.in_(l2_ids)
+        ).order_by(L2Summary.id.asc()))
+    if not items:
+        return 0
+    texts = [x.text or "" for x in items]
+    try:
+        l3_text = await summarizer.summarize_l2_block_to_l3(texts, lang or "ru")
+    except Exception:
+        # fallback – join first lines
+        bullets = [f"• {(t.splitlines() or [''])[0][:160]}" for t in texts[:2]]
+        l3_text = "\n".join(bullets)
+    with session_scope() as s:
+        # re-fetch to ensure they still exist; adjust if some disappeared
+        current = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id, L2Summary.id.in_([x.id for x in items])).order_by(L2Summary.id.asc()))
+        if not current:
             return 0
-        l2_texts = [x.text or "" for x in items]
-        try:
-            if loop and loop.is_running():
-                l3_text = "\n".join([f"• {(t.splitlines() or [''])[0][:200]}" for t in l2_texts[:2]])
-            else:
-                loop = loop or asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                l3_text = loop.run_until_complete(summarizer.summarize_l2_block_to_l3(l2_texts, lang or "ru"))
-        except Exception:
-            bullets = [f"• {(t.splitlines() or [''])[0][:200]}" for t in l2_texts]
-            l3_text = "\n".join(bullets[:2])
-        start_id = items[0].id; end_id = items[-1].id
-        l3 = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=l3_text, tokens=approx_tokens(l3_text), created_at=now)
-        s.add(l3)
-        for x in items:
+        start_id = current[0].id
+        end_id = current[-1].id
+        rec = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=l3_text, tokens=approx_tokens(l3_text), created_at=now)
+        s.add(rec)
+        for x in current:
             s.delete(x)
-        return 1
+    return 1
+
+# Sync wrappers (if needed by legacy sync code)
+
+def ensure_l2_for_pairs_sync(thread_id: str, pairs: List[Tuple[str,str]], lang: str, now: int) -> int:
+    return asyncio.run(ensure_l2_for_pairs(thread_id, pairs, lang, now))
+
+def promote_l2_to_l3_sync(thread_id: str, l2_ids: List[int], lang: str, now: int) -> int:
+    return asyncio.run(promote_l2_to_l3(thread_id, l2_ids, lang, now))
+
+# Existing legacy sync versions were removed to avoid run_until_complete blocking.
+
+# Additional summarization post-reply helpers
 
 def insert_l2_summary(thread_id: str, start_msg_id: str, end_msg_id: str, text: str, now: int):
     from packages.utils.tokens import approx_tokens
@@ -405,10 +422,12 @@ def insert_l2_summary(thread_id: str, start_msg_id: str, end_msg_id: str, text: 
         s.add(rec)
         return rec
 
+
 def pick_oldest_l2_block(thread_id: str, max_items: int = 5):
     with session_scope() as s:
         q = s.query(L2Summary).filter(L2Summary.thread_id == thread_id).order_by(L2Summary.id.asc()).limit(max_items)
         return list(q)
+
 
 def insert_l3_summary(thread_id: str, l2_ids: list[int], text: str, now: int):
     from packages.utils.tokens import approx_tokens
@@ -420,6 +439,7 @@ def insert_l3_summary(thread_id: str, l2_ids: list[int], text: str, now: int):
         s.add(rec)
         return rec
 
+
 def delete_l2_batch(l2_ids: list[int]):
     if not l2_ids:
         return 0
@@ -430,6 +450,7 @@ def delete_l2_batch(l2_ids: list[int]):
             if row:
                 s.delete(row); cnt += 1
         return cnt
+
 
 def evict_l3_oldest(thread_id: str, count: int = 3) -> int:
     with session_scope() as s:
@@ -460,3 +481,25 @@ def get_thread_messages_for_l1(thread_id: str, exclude_message_id: str | None = 
         for m in items:
             m.content = redact_fragment(m.content or "")
         return items[-max_items:]
+
+
+def get_l2_for_thread(thread_id: str, limit: int = 200):
+    """Return L2 summaries ASC (oldest first)."""
+    with session_scope() as s:
+        return list(
+            s.query(L2Summary)
+             .filter(L2Summary.thread_id == thread_id)
+             .order_by(L2Summary.id.asc())
+             .limit(limit)
+        )
+
+
+def get_l3_for_thread(thread_id: str, limit: int = 200):
+    """Return L3 micro summaries ASC (oldest first)."""
+    with session_scope() as s:
+        return list(
+            s.query(L3MicroSummary)
+             .filter(L3MicroSummary.thread_id == thread_id)
+             .order_by(L3MicroSummary.id.asc())
+             .limit(limit)
+        )

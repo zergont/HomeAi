@@ -499,9 +499,10 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         tool_results_tokens=0,
         last_user_lang=None,
         current_user_text=req.input,
+        current_user_id=current_user_id,
     )
     system_text = assembled["system_text"]
-    messages_for_provider = ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
+    messages_for_provider = assembled.get("provider_messages") or ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
 
     # Preflight tokens with silence protection
     try:
@@ -521,9 +522,23 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     # metadata base
     metadata = {"context_budget": assembled.get("context_budget"), "context_assembly": assembled.get("stats", {})}
     metadata["context_assembly"]["l1_pairs_count"] = assembled.get("stats", {}).get("l1_pairs_count", 0)
-    metadata["context_assembly"]["token_count_mode"] = token_mode
-    metadata["context_assembly"]["prompt_tokens_precise"] = int(prompt_tok)
-    metadata["context_assembly"]["free_out_cap"] = int(free_out)
+    if 'includes' in assembled.get('stats', {}):
+        metadata["context_assembly"]["includes"] = assembled['stats']['includes']
+    # summary counters (parsed from compaction_steps)
+    steps_list = metadata["context_assembly"].get("compaction_steps", []) or []
+    sc = {"l1_to_l2": 0, "l2_to_l3": 0}
+    for _st in steps_list:
+        if _st.startswith("l1_to_l2:"):
+            try:
+                sc["l1_to_l2"] += int(_st.split(":",1)[1])
+            except Exception:
+                pass
+        elif _st.startswith("l2_to_l3:"):
+            try:
+                sc["l2_to_l3"] += int(_st.split(":",1)[1])
+            except Exception:
+                pass
+    metadata["context_assembly"]["summary_counters"] = sc
 
     provider_request = {
         "url": f"{provider_info['base_url'].rstrip('/')}/v1/chat/completions",
@@ -646,9 +661,11 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             nonlocal last_delta_ts
             # First send user echo
             await queue.put(await _sse_format("message", {"role":"user","content": redact_fragment(req.input), "message_id": current_user_id, "thread_id": thread_id}))
-            # Then meta
+            # Initial meta
             meta_payload = {"id": resp_id, "created": created, "model": provider_model, "provider": provider_info, "status": "in_progress", "metadata": {"thread_id": thread_id, "context_budget": metadata["context_budget"], "context_assembly": metadata["context_assembly"], "provider_request": provider_request}}
             await send_sse_meta(queue, meta_payload)
+            # Batched meta.update with summary counters (optional duplicate for live UI refresh)
+            await queue.put(await _sse_format("meta.update", {"summary_counters": metadata["context_assembly"].get("summary_counters", {}), "includes": metadata["context_assembly"].get("includes", {})}))
             try:
                 log_lm.info("lmstudio.agenerate_stream start: model_id=%s", provider_model)
                 async for frag in provider.agenerate_stream(

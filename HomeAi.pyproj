@@ -78,12 +78,14 @@
     <Compile Include="local-responses\tests\test_memory_in_responses.py" />
     <Compile Include="local-responses\tests\test_memory_levels.py" />
     <Compile Include="local-responses\tests\test_model_context_endpoint.py" />
+    <Compile Include="local-responses\tests\test_payload_contains_l2_l3.py" />
     <Compile Include="local-responses\tests\test_profile.py" />
     <Compile Include="local-responses\tests\test_responses.py" />
     <Compile Include="local-responses\tests\test_responses_budget_metadata.py" />
     <Compile Include="local-responses\tests\test_responses_with_assembly_metadata.py" />
     <Compile Include="local-responses\tests\test_storage.py" />
     <Compile Include="local-responses\tests\test_streaming.py" />
+    <Compile Include="local-responses\tests\test_summary_pipeline.py" />
     <Compile Include="local-responses\tests\__init__.py" />
   </ItemGroup>
   <ItemGroup>
