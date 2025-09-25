@@ -462,14 +462,19 @@ def evict_l3_oldest(thread_id: str, count: int = 3) -> int:
 
 # NEW: full history fetch for L1 tail building
 
-def get_thread_messages_for_l1(thread_id: str, exclude_message_id: str | None = None, max_items: int = 500):
-    """Return entire user/assistant history (ASC), optionally excluding the provided message id and anything after it.
-    Sanitizes content via redact_fragment (removes <think>). Limited by max_items from tail for safety.
+def get_thread_messages_for_l1(thread_id: str, exclude_message_id: str | None = None, max_items: int = 2000):
+    """Return entire user/assistant history (ASC by time,id), optionally excluding current (and newer) message.
+    Sanitizes content via redact_fragment (<think> removal). Returns tail limited by max_items.
     """
     with session_scope() as s:
-        q = (s.query(Message)
-               .filter(Message.thread_id == thread_id, Message.role.in_(("user","assistant")))
-               .order_by(Message.created_at.asc()))
+        q = (
+            s.query(Message)
+             .filter(
+                 Message.thread_id == thread_id,
+                 Message.role.in_(("user", "assistant"))
+             )
+             .order_by(Message.created_at.asc(), Message.id.asc())
+        )
         items = list(q)
         if exclude_message_id:
             trimmed = []

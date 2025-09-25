@@ -539,6 +539,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             except Exception:
                 pass
     metadata["context_assembly"]["summary_counters"] = sc
+    if 'l1_order_preview' in assembled.get('stats', {}):
+        metadata['context_assembly']['l1_order_preview'] = assembled['stats']['l1_order_preview']
 
     provider_request = {
         "url": f"{provider_info['base_url'].rstrip('/')}/v1/chat/completions",
