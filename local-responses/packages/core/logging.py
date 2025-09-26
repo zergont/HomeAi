@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import os
 from typing import Any, Dict, Optional
 
 from fastapi import Request, Response
@@ -26,14 +27,51 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-def configure_logging(level: str = "INFO") -> None:
+class PlainFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        lvl = record.levelname.ljust(5)
+        logger_name = record.name
+        base = f"{ts} | {lvl} | {logger_name}:"
+        msg = record.msg
+        if isinstance(msg, dict):
+            # Flatten one level dict to key=value parts
+            parts = []
+            for k, v in msg.items():
+                try:
+                    if isinstance(v, (dict, list)):
+                        v_str = json.dumps(v, ensure_ascii=False)
+                    else:
+                        v_str = str(v)
+                except Exception:
+                    v_str = "<err>"
+                # Protect spaces
+                if " " in v_str or ";" in v_str:
+                    v_str = f'"{v_str}"'
+                parts.append(f"{k}={v_str}")
+            text = " ".join(parts)
+        else:
+            text = record.getMessage()
+        if record.exc_info:
+            text += "\n" + self.formatException(record.exc_info)
+        return f"{base} {text}".rstrip()
+
+
+def configure_logging(level: str = "INFO", fmt: Optional[str] = None) -> None:
+    """Configure root logging.
+    fmt: 'json' (default) or 'plain'/'human'/'text'. If None, read LOG_FORMAT env.
+    Note: pydantic BaseSettings does NOT export .env vars to os.environ, so pass settings.log_format explicitly.
+    """
     root = logging.getLogger()
     root.setLevel(level.upper())
 
     handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
+    use_fmt = (fmt or os.getenv("LOG_FORMAT", "json")).lower()
+    if use_fmt in ("plain", "text", "human"):
+        handler.setFormatter(PlainFormatter())
+    else:
+        handler.setFormatter(JsonFormatter())
 
-    # Clear existing handlers to avoid duplicates in reload
     root.handlers.clear()
     root.addHandler(handler)
 

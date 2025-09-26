@@ -67,7 +67,7 @@ except Exception:  # fallback dummies
     LR_SUMMARY_CREATED = _Dummy(); LR_COMPACTION_STEPS = _Dummy()
 
 settings = get_settings()
-configure_logging(level=settings.log_level)
+configure_logging(level=settings.log_level, fmt=getattr(settings, 'log_format', None))
 
 app = FastAPI(title=settings.app_name, version="0.0.1")
 log_lm = logging.getLogger("app.lmstudio")
