@@ -278,7 +278,7 @@ async def config() -> JSONResponse:
         },
         "profile": safe_profile_output(prof_dict) | {"core_tokens": core_tokens, "core_cap": core_cap},
     }
-    return JSONResponse(content=safe_config)
+    return JSONResponse(content=safe_config);
 
 
 @app.get("/providers/lmstudio/health")
@@ -506,8 +506,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
     # Preflight tokens with silence protection
     try:
-        prompt_tok = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
-        token_mode = "proxy"
+        prompt_tok, token_mode = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, use_cache=True)
     except Exception:
         prompt_tok = approx_tokens_messages(messages_for_provider)
         token_mode = "approx"
