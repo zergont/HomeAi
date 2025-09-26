@@ -55,6 +55,9 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
   const sc = asm.summary_counters ?? {}
   const inc = asm.includes ?? {}
 
+  // HF-29D warning: L1 filled but no summaries produced
+  const warnNoSumm = asm?.token_count_mode === 'proxy' && (asm?.l1_pairs_count ?? 0) > 8 && (sc?.l1_to_l2 ?? 0) === 0
+
   const renderEvent = (e: Ev, i: number) => {
     const badge = (txt: string, cls: string) => (
       <span className={`inline-block text-[10px] px-2 py-0.5 rounded ${cls}`}>{txt}</span>
@@ -178,6 +181,11 @@ export default function EventsConsole({ events }: { events: Ev[] }) {
       {(ctxBudget || ctxAsm) && (
         <div className="p-2 border rounded bg-white text-xs">
           <div className="font-semibold mb-1">Final metadata</div>
+          {warnNoSumm && (
+            <div className="mb-2 px-2 py-1 rounded bg-amber-100 text-amber-700 border border-amber-300 text-[11px]">
+              Внимание: L1 заполнен, но саммари (L2) не создано. Проверь summarizer / L2 pipeline.
+            </div>
+          )}
           {ctxBudget && (
             <div className="mb-2">
               <div className="text-gray-600">context_budget</div>

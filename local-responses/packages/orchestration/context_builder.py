@@ -10,14 +10,14 @@ from packages.storage.repo import (
     get_profile, session_scope, get_thread_messages_for_l1,
     get_l2_for_thread, get_l3_for_thread, ensure_l2_for_pairs, promote_l2_to_l3
 )
-from packages.storage.models import L2Summary, L3MicroSummary, Message
+from packages.storage.models import Message
 from packages.utils.tokens import approx_tokens, profile_text_view
 from packages.utils.i18n import pick_lang, t
 from packages.orchestration.token_budget import tokens_breakdown
 
 logger = logging.getLogger("app.context")
 
-# --- HF-28 canonical helpers ---
+# --- HF-28/29 canonical helpers ---
 
 def build_pairs_asc(items: List[Message]) -> List[Tuple[Message, Message]]:
     pairs: List[Tuple[Message, Message]] = []
@@ -87,9 +87,9 @@ async def assemble_context(
     L2_cap = int(math.floor(st.mem_l2_share * work_left))
     L3_cap = int(math.floor(st.mem_l3_share * work_left))
 
-    # Fetch existing summaries ASC
-    l3_records = get_l3_for_thread(thread_id, limit=200)
-    l2_records = get_l2_for_thread(thread_id, limit=500)
+    # Initial summaries ASC (will reload after eager L2)
+    l3_records = get_l3_for_thread(thread_id, limit=getattr(st, 'L3_FETCH_LIMIT', 200))
+    l2_records = get_l2_for_thread(thread_id, limit=getattr(st, 'L2_FETCH_LIMIT', 500))
 
     # History for L1
     hist = get_thread_messages_for_l1(thread_id, exclude_message_id=current_user_id, max_items=2000)
@@ -111,7 +111,7 @@ async def assemble_context(
     msgs_l2 = [{'role': 'assistant', 'content': r.text, 'id': f'l2#{r.id}:{r.start_message_id}->{r.end_message_id}'} for r in l2_records]
 
     base_blocks = {'system': msgs_system, 'l3': msgs_l3, 'l2': msgs_l2}
-    bd0 = tokens_breakdown(model_id, {**base_blocks, 'l1': [], 'user': []})
+    tokens_breakdown(model_id, {**base_blocks, 'l1': [], 'user': []})  # bd0 (unused directly)
 
     C_eff = int(budgets.get('C_eff', 0))
     R_sys = int(budgets.get('R_sys', 0))
@@ -121,14 +121,14 @@ async def assemble_context(
 
     # Fill-to-cap: newest→oldest trial insertion
     for (u, a) in reversed(pairs_all):
-        trial_pairs = [(u, a)] + chosen_pairs  # new oldest candidate at front to maintain ASC when assigned
+        trial_pairs = [(u, a)] + chosen_pairs
         trial_l1 = flatten_pairs_asc(trial_pairs)
         bd_try = tokens_breakdown(model_id, {**base_blocks, 'l1': trial_l1, 'user': ([{'role': 'user', 'content': current_user_text or ''}] if current_user_text else [])})
         l1_used = bd_try['l1']
         total = bd_try['total']
         free_out_cap = max(0, C_eff - total - R_sys - Safety)
         if l1_used <= L1_cap and free_out_cap >= 0:
-            chosen_pairs = trial_pairs  # accept
+            chosen_pairs = trial_pairs
         else:
             break
 
@@ -142,22 +142,36 @@ async def assemble_context(
 
     l1_msgs_out = flatten_pairs_asc(chosen_pairs)
 
-    # Remaining pairs become old_pairs for future compaction (not executed here; compactor later)
-    old_pairs = pairs_all[:-len(chosen_pairs)] if chosen_pairs else pairs_all
+    # HF-29A: eager L2 summarization for old pairs
+    now_ts = int(time.time())
+    created_l2 = 0
+    if pairs_all and len(chosen_pairs) < len(pairs_all) and getattr(st, 'SUMMARIZE_INSTEAD_OF_TRIM', True):
+        old_pairs = pairs_all[:len(pairs_all) - len(chosen_pairs)]  # strictly older than L1 window
+        try:
+            created_l2 = await ensure_l2_for_pairs(thread_id, [(u.id, a.id) for (u, a) in old_pairs], last_user_lang or 'ru', now_ts)
+        except Exception as exc:
+            logger.warning("eager L2 summarization failed: %s", exc)
+    # Reload summaries after eager L2
+    if created_l2:
+        l2_records = get_l2_for_thread(thread_id, limit=getattr(st, 'L2_FETCH_LIMIT', 500))
+        msgs_l2 = [{'role': 'assistant', 'content': r.text, 'id': f'l2#{r.id}:{r.start_message_id}->{r.end_message_id}'} for r in l2_records]
+        # (Potential future eager L3 promotion can be added here)
 
-    # Token breakdown after L1
-    bd_final = tokens_breakdown(model_id, {**base_blocks, 'l1': l1_msgs_out, 'user': ([{'role': 'user', 'content': current_user_text or ''}] if current_user_text else [])})
+    # Token breakdown after L1 (and possibly updated L2)
+    bd_final = tokens_breakdown(model_id, {**base_blocks, 'l2': msgs_l2, 'l1': l1_msgs_out, 'user': ([{'role': 'user', 'content': current_user_text or ''}] if current_user_text else [])})
     free_out_cap = max(0, C_eff - bd_final['total'] - R_sys - Safety)
 
-    compaction_steps: List[str] = []  # HF-28: compaction loop could be added here if free_out unsafe (omitted for brevity)
+    compaction_steps: List[str] = []
+    if created_l2:
+        compaction_steps.append(f"l1_to_l2:{created_l2}")
 
-    # Diagnostics
+    # Diagnostics order log
     if chosen_pairs:
         first_pair = chosen_pairs[0]
         last_pair = chosen_pairs[-1]
         logger.debug("L1.order: pairs=%d first u#%s->a#%s last u#%s->a#%s", len(chosen_pairs), first_pair[0].id, first_pair[1].id, last_pair[0].id, last_pair[1].id)
 
-    # Build provider messages
+    # Build provider messages (with refreshed L2/L3)
     msgs_user = ([{'role':'user','content': current_user_text or '', 'id': current_user_id or 'current_user'}] if current_user_text else [])
     provider_messages = msgs_system + msgs_tools + msgs_l3 + msgs_l2 + l1_msgs_out + msgs_user
 
@@ -188,6 +202,10 @@ async def assemble_context(
             if len(chosen_pairs) > 6 else [f"{p[0].id}->{p[1].id}" for p in chosen_pairs]
         ),
     }
+
+    # Provide explicit summary counters if eager L2 happened
+    if created_l2:
+        stats['summary_counters'] = {'l1_to_l2': created_l2, 'l2_to_l3': 0}
 
     # Fill pct diagnostics
     def pct(v: int, cap: int): return int(round(100 * v / cap)) if cap > 0 else 0
