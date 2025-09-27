@@ -28,6 +28,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class PlainFormatter(logging.Formatter):
+    # Human readable formatter; supports dict messages
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         lvl = record.levelname.ljust(5)
@@ -57,17 +58,13 @@ class PlainFormatter(logging.Formatter):
         return f"{base} {text}".rstrip()
 
 
-def configure_logging(level: str = "INFO", fmt: Optional[str] = None) -> None:
-    """Configure root logging.
-    fmt: 'json' (default) or 'plain'/'human'/'text'. If None, read LOG_FORMAT env.
-    Note: pydantic BaseSettings does NOT export .env vars to os.environ, so pass settings.log_format explicitly.
-    """
+def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.setLevel(level.upper())
 
     handler = logging.StreamHandler()
-    use_fmt = (fmt or os.getenv("LOG_FORMAT", "json")).lower()
-    if use_fmt in ("plain", "text", "human"):
+    fmt = os.getenv("LOG_FORMAT", "json").lower()
+    if fmt in ("plain", "text", "human"):
         handler.setFormatter(PlainFormatter())
     else:
         handler.setFormatter(JsonFormatter())

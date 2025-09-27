@@ -50,6 +50,8 @@ from packages.orchestration.memory_manager import update_memory
 from packages.orchestration.tool_runtime import ToolRuntime
 from packages.orchestration.stream_handlers import ToolCallAssembler
 from packages.orchestration.retry_policy import make_retry_suffix, should_retry_length
+from packages.orchestration.after_reply import normalize_after_reply
+from packages.core import settings as ST  # optional module alias for limits
 
 # Prometheus metrics (simple counters)
 try:
@@ -67,7 +69,7 @@ except Exception:  # fallback dummies
     LR_SUMMARY_CREATED = _Dummy(); LR_COMPACTION_STEPS = _Dummy()
 
 settings = get_settings()
-configure_logging(level=settings.log_level, fmt=getattr(settings, 'log_format', None))
+configure_logging(level=settings.log_level)
 
 app = FastAPI(title=settings.app_name, version="0.0.1")
 log_lm = logging.getLogger("app.lmstudio")
@@ -278,7 +280,7 @@ async def config() -> JSONResponse:
         },
         "profile": safe_profile_output(prof_dict) | {"core_tokens": core_tokens, "core_cap": core_cap},
     }
-    return JSONResponse(content=safe_config);
+    return JSONResponse(content=safe_config)
 
 
 @app.get("/providers/lmstudio/health")
@@ -429,10 +431,8 @@ async def get_thread_messages(thread_id: str) -> JSONResponse:
         "context": ctx,
     })
 
-
 async def _sse_format(event: str, data: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
-
 
 def _ensure_thread(req: ResponsesRequest) -> str:
     thread_id = req.thread_id
@@ -464,10 +464,8 @@ async def tokenize(req: TokenizeReq):
         return {"mode": "text", "prompt_tokens": n}
     return {"error": "provide messages or text"}
 
-
 async def send_sse_meta(queue, payload: Dict[str, Any]):
     await queue.put(await _sse_format("meta", payload))
-
 
 @app.post("/responses")
 async def create_response(request: Request, req: ResponsesRequest, stream: bool = False):
@@ -506,7 +504,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
 
     # Preflight tokens with silence protection
     try:
-        prompt_tok, token_mode = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, use_cache=True)
+        prompt_tok = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
+        token_mode = "proxy"
     except Exception:
         prompt_tok = approx_tokens_messages(messages_for_provider)
         token_mode = "approx"
@@ -572,14 +571,12 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     tool_calls.append({"call": call, "result": result})
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else 500
-            # Provide clearer message for common 404 when model/endpoint is unavailable
             if status == 404:
                 msg = (
                     "Upstream returned 404. Ensure LM Studio is running, the base URL is correct, "
                     "and the selected model is loaded and supports /v1/chat/completions."
                 )
                 raise HTTPException(status_code=424, detail=msg)
-            # Pass through other client/server errors with context
             detail_text = None
             try:
                 detail_text = e.response.text
@@ -589,6 +586,43 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Failed to reach LM Studio: {e}")
         usage_vals = usage_dict or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        # Persist assistant message first
+        assistant_msg = append_message(thread_id, "assistant", text, tokens=usage_vals)
+        # HF-31B post-reply normalization (eager cascade) — recompute L1/L2/L3 & compaction
+        try:
+            caps = (metadata.get("context_assembly", {}).get("caps")
+                    or assembled.get("stats", {}).get("caps")
+                    or {"l1": 0, "l2": 0, "l3": 0})
+            # Extract numeric caps if keys are named differently
+            norm_caps = {
+                "l1": caps.get("l1") or caps.get("L1") or 0,
+                "l2": caps.get("l2") or caps.get("L2") or 0,
+                "l3": caps.get("l3") or caps.get("L3") or 0,
+            }
+            system_text_for_norm = assembled.get("system_text") or system_text
+            norm_result = await normalize_after_reply(
+                model_id=provider_model,
+                thread_id=thread_id,
+                system_msg={"role": "system", "content": system_text_for_norm} if system_text_for_norm else None,
+                lang="ru",
+                caps=norm_caps,
+                meta=metadata,
+            )
+            asm = metadata.setdefault("context_assembly", {})
+            asm["compaction_steps"] = (asm.get("compaction_steps") or []) + norm_result.get("compaction_steps", [])
+            sc = asm.setdefault("summary_counters", {"l1_to_l2": 0, "l2_to_l3": 0})
+            sc["l1_to_l2"] += norm_result.get("summary_counters", {}).get("l1_to_l2", 0)
+            sc["l2_to_l3"] += norm_result.get("summary_counters", {}).get("l2_to_l3", 0)
+            # refresh includes after normalization
+            from packages.storage import repo as repo_mod
+            st_inst = get_settings()
+            l2_records_norm = repo_mod.get_l2_for_thread(thread_id, limit=getattr(st_inst, 'L2_FETCH_LIMIT', 500))
+            l3_records_norm = repo_mod.get_l3_for_thread(thread_id, limit=getattr(st_inst, 'L3_FETCH_LIMIT', 200))
+            inc = asm.setdefault("includes", {})
+            inc["l2_pairs"] = [{"id": r.id, "u": r.start_message_id, "a": r.end_message_id} for r in l2_records_norm]
+            inc["l3_ids"] = [r.id for r in l3_records_norm]
+        except Exception:
+            pass
         cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
         out_item = ResponsesOutputItem(content=[{"type": "output_text", "text": text}])
         meta_common = {"thread_id": thread_id, "context_budget": metadata["context_budget"], "context_assembly": metadata["context_assembly"]}
@@ -600,9 +634,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             output=[out_item],
             usage=ResponsesUsage(**usage_vals),
             provider=provider_info,
-            metadata=meta_common | {"provider_request": provider_request, "tool_calls": tool_calls} | (req.metadata or {}),
+            metadata=meta_common | {"provider_request": provider_request, "tool_calls": []} | (req.metadata or {}),
         )
-        append_message(thread_id, "assistant", text, tokens=usage_vals)
         save_response(
             resp_id=resp.id,
             thread_id=thread_id,
@@ -705,9 +738,38 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             final_text = "".join(collected)
             usage_vals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             append_message(thread_id, "assistant", final_text, tokens=usage_vals)
+            # Post-reply normalization HF-31B before final meta events
+            try:
+                caps = metadata.get("context_assembly", {}).get("caps") or assembled.get("stats", {}).get("caps") or {"l1":0,"l2":0,"l3":0}
+                norm_caps = {"l1": caps.get("l1") or 0, "l2": caps.get("l2") or 0, "l3": caps.get("l3") or 0}
+                system_text_for_norm = assembled.get("system_text") or system_text
+                norm_result = await normalize_after_reply(
+                    model_id=provider_model,
+                    thread_id=thread_id,
+                    system_msg={"role": "system", "content": system_text_for_norm} if system_text_for_norm else None,
+                    lang="ru",
+                    caps=norm_caps,
+                    meta=metadata,
+                )
+                asm = metadata.setdefault("context_assembly", {})
+                asm["compaction_steps"] = (asm.get("compaction_steps") or []) + norm_result.get("compaction_steps", [])
+                sc = asm.setdefault("summary_counters", {"l1_to_l2": 0, "l2_to_l3": 0})
+                sc["l1_to_l2"] += norm_result.get("summary_counters", {}).get("l1_to_l2", 0)
+                sc["l2_to_l3"] += norm_result.get("summary_counters", {}).get("l2_to_l3", 0)
+                from packages.storage import repo as repo_mod
+                st_inst = get_settings()
+                l2_records_norm = repo_mod.get_l2_for_thread(thread_id, limit=getattr(st_inst, 'L2_FETCH_LIMIT', 500))
+                l3_records_norm = repo_mod.get_l3_for_thread(thread_id, limit=getattr(st_inst, 'L3_FETCH_LIMIT', 200))
+                inc = asm.setdefault("includes", {})
+                inc["l2_pairs"] = [{"id": r.id, "u": r.start_message_id, "a": r.end_message_id} for r in l2_records_norm]
+                inc["l3_ids"] = [r.id for r in l3_records_norm]
+                await queue.put(await _sse_format("meta.update", {"summary_counters": sc, "includes": inc, "compaction_steps": asm.get("compaction_steps", [])}))
+            except Exception:
+                pass
             cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
             response_json = json.dumps({"id": resp_id, "object": "response", "created": created, "model": provider_model, "status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": final_text}]}], "usage": usage_vals, "provider": provider_info, "metadata": {"thread_id": thread_id}}, ensure_ascii=False)
             save_response(resp_id=resp_id, thread_id=thread_id, request_json=json.dumps(req.model_dump(), ensure_ascii=False), response_json=response_json, status="cancelled" if cancel_flag["cancelled"] else "completed", model=provider_model, provider_name=provider_info["name"], provider_base_url=provider_info["base_url"], usage=usage_vals, cost=cost)
+            # ... existing memory + summary scheduling code remains ...
             try:
                 tool_results_tokens = 0
                 mem = await update_memory(thread_id, assembled.get("context_budget", {}), tool_results_tokens, int(time.time()))
@@ -716,8 +778,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                 pass
             with session_scope() as s:
                 t = s.get(Thread, thread_id)
-                meta = {"summary_scheduled": False, "summary_reason": "stream"}
-                await queue.put(await _sse_format("meta.update", meta))
+                meta2 = {"summary_scheduled": False, "summary_reason": "stream"}
+                await queue.put(await _sse_format("meta.update", meta2))
                 if t and t.summary:
                     await queue.put(await _sse_format("summary", {"summary": t.summary, "summary_updated_at": t.summary_updated_at.isoformat() if t.summary_updated_at else None}))
             await queue.put(await _sse_format("usage", usage_vals))
@@ -739,7 +801,6 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             cancel_flag["cancelled"] = True
         finally:
             prod_task.cancel(); hb_task.cancel(); ACTIVE_STREAMS.pop(resp_id, None)
-
     headers = {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_iter(), headers=headers)
 

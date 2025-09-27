@@ -17,8 +17,7 @@ def tokens_breakdown(model_id: str, messages_blocks: Dict[str, List[Dict[str, An
 
     def _count(msgs: List[Dict[str, Any]]) -> Tuple[int, str]:
         if st.TOKEN_COUNT_MODE == 'proxy':
-            # New signature returns (tokens, mode)
-            tokens, mode = lmstudio_tokens.count_tokens_chat(model_id, msgs, use_cache=True)
+            tokens, mode = lmstudio_tokens.count_tokens_chat(model_id, msgs)  # no use_cache kw for compatibility
             return int(tokens), mode
         # approx mode
         return approx_tokens_messages(msgs), 'approx'

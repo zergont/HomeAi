@@ -146,20 +146,16 @@ async def assemble_context(
     now_ts = int(time.time())
     created_l2 = 0
     if pairs_all and len(chosen_pairs) < len(pairs_all) and getattr(st, 'SUMMARIZE_INSTEAD_OF_TRIM', True):
-        # Use spec slicing pairs_all[:-len(chosen_pairs)] (empty if chosen_pairs empty)
-        if len(chosen_pairs) == 0:
-            old_pairs = []  # nothing yet in L1 (will rely on minimum fill afterwards)
-        else:
-            old_pairs = pairs_all[:-len(chosen_pairs)]
-        if old_pairs:
-            try:
-                created_l2 = await ensure_l2_for_pairs(thread_id, [(u.id, a.id) for (u, a) in old_pairs], lang or 'ru', now_ts)
-            except Exception as exc:
-                logger.warning("eager L2 summarization failed: %s", exc)
+        old_pairs = pairs_all[:len(pairs_all) - len(chosen_pairs)]  # strictly older than L1 window
+        try:
+            created_l2 = await ensure_l2_for_pairs(thread_id, [(u.id, a.id) for (u, a) in old_pairs], last_user_lang or 'ru', now_ts)
+        except Exception as exc:
+            logger.warning("eager L2 summarization failed: %s", exc)
     # Reload summaries after eager L2
     if created_l2:
         l2_records = get_l2_for_thread(thread_id, limit=getattr(st, 'L2_FETCH_LIMIT', 500))
         msgs_l2 = [{'role': 'assistant', 'content': r.text, 'id': f'l2#{r.id}:{r.start_message_id}->{r.end_message_id}'} for r in l2_records]
+        # (Potential future eager L3 promotion can be added here)
 
     # Token breakdown after L1 (and possibly updated L2)
     bd_final = tokens_breakdown(model_id, {**base_blocks, 'l2': msgs_l2, 'l1': l1_msgs_out, 'user': ([{'role': 'user', 'content': current_user_text or ''}] if current_user_text else [])})
@@ -207,8 +203,8 @@ async def assemble_context(
         ),
     }
 
+    # Provide explicit summary counters if eager L2 happened
     if created_l2:
-        # Increment or set summary counters
         stats['summary_counters'] = {'l1_to_l2': created_l2, 'l2_to_l3': 0}
 
     # Fill pct diagnostics
