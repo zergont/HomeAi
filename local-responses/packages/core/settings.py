@@ -17,6 +17,7 @@ class AppSettings(BaseSettings):
     app_port: int = 8000
 
     log_level: str = "INFO"
+    log_format: str = Field(default="json", validation_alias="LOG_FORMAT")
     db_url: str = "sqlite:///data/app.db"
 
     # Provider endpoints
@@ -63,6 +64,16 @@ class AppSettings(BaseSettings):
     summary_debounce_sec: int = Field(default=300, validation_alias="SUMMARY_DEBOUNCE_SEC")
     SUMMARY_GEN_MAX_TOKENS: int = Field(default=512, validation_alias="SUMMARY_GEN_MAX_TOKENS")
 
+    # Group compaction
+    L2_GROUP_SIZE: int = Field(default=4, validation_alias="L2_GROUP_SIZE")  # pairs per one L2 summary
+    L3_GROUP_SIZE: int = Field(default=5, validation_alias="L3_GROUP_SIZE")  # L2 records per one L3 micro summary
+    L2_GROUP_MAX_TOKENS: int = Field(default=320, validation_alias="L2_GROUP_MAX_TOKENS")
+    # HF-34: tighten and add quality constraints for L3
+    L3_GROUP_MAX_TOKENS: int = Field(default=128, validation_alias="L3_GROUP_MAX_TOKENS")
+    L3_MIN_NONEMPTY_CHARS: int = Field(default=30, validation_alias="L3_MIN_NONEMPTY_CHARS")
+    L3_RETRY_ATTEMPTS: int = Field(default=2, validation_alias="L3_RETRY_ATTEMPTS")
+    L3_STYLE: str = Field(default="sentences", validation_alias="L3_STYLE")  # sentences|bullets
+
     # Pricing overrides
     price_per_1k_default: float = Field(default=0.0, validation_alias="PRICE_PER_1K_DEFAULT")
     price_overrides: Dict[str, float] = Field(default_factory=dict)
@@ -89,9 +100,10 @@ class AppSettings(BaseSettings):
     L3_HIGH: int = Field(default=90, validation_alias="L3_HIGH")
     L3_LOW: int = Field(default=70, validation_alias="L3_LOW")
 
-    # Output / safety invariants
-    R_OUT_MIN: int = Field(default=256, validation_alias="R_OUT_MIN")  # desired minimal free output tokens
-    SAFETY_TOK: int = Field(default=64, validation_alias="SAFETY_TOK")  # fixed safety reserve
+    # Output / safety invariants + preflight compactor targets
+    R_OUT_MIN: int = Field(default=256, validation_alias="R_OUT_MIN")
+    R_OUT_FLOOR: int = Field(default=64, validation_alias="R_OUT_FLOOR")
+    SAFETY_TOK: int = Field(default=64, validation_alias="SAFETY_TOK")
 
     @property
     def db_dialect(self) -> str:

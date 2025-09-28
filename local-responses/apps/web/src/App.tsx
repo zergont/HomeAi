@@ -6,8 +6,10 @@ import StatusIndicators from './components/StatusIndicators'
 import { getThreadMessages, postResponses, streamResponses, cancelResponse, type ThreadMessagesResponse } from './lib/api'
 import ProfilePage from './pages/Profile'
 
+interface MemoryPayload { thread_id: string; l1_pairs: any[]; l2: any[]; l3: any[] }
+
 export default function App() {
-  const [tab, setTab] = useState<'chat'|'profile'|'output'>('chat')
+  const [tab, setTab] = useState<'chat'|'profile'|'output'|'l1'|'l2'|'l3'>('chat')
   const [model, setModel] = useState('')
   const [system, setSystem] = useState('')
   const [input, setInput] = useState('')
@@ -25,6 +27,8 @@ export default function App() {
   const abortCtrl = useRef<AbortController|null>(null)
   const threadIdRef = useRef<string|null>(null)
 
+  const [memory, setMemory] = useState<MemoryPayload|null>(null)
+
   // summarization indicator
   const [summarizing, setSummarizing] = useState(false)
   const [summarizeSince, setSummarizeSince] = useState<number|null>(null)
@@ -36,13 +40,22 @@ export default function App() {
     let t: any
     if (summarizing && summarizeSince) {
       const tick = () => setSummaryElapsed(Math.floor((Date.now() - summarizeSince) / 1000))
-      tick()
-      t = setInterval(tick, 500)
-    } else {
-      setSummaryElapsed(0)
-    }
+      tick(); t = setInterval(tick, 500)
+    } else { setSummaryElapsed(0) }
     return () => { if (t) clearInterval(t) }
   }, [summarizing, summarizeSince])
+
+  const fetchMemory = async () => {
+    if (!threadIdRef.current) return
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/threads/${threadIdRef.current}/memory`)
+      if (res.ok) {
+        const data = await res.json(); setMemory(data)
+      }
+    } catch {}
+  }
+
+  useEffect(() => { if (['l1','l2','l3'].includes(tab)) fetchMemory() }, [tab])
 
   const onSend = async () => {
     setEvents([]); setAssistantText('')
@@ -52,10 +65,7 @@ export default function App() {
         const res = await postResponses(body)
         const ts = new Date().toLocaleTimeString()
         // meta
-        setEvents(prev => [
-          ...prev,
-          { event: 'meta', data: { id: res.id, created: res.created, model: res.model, provider: res.provider, status: res.status || 'completed', metadata: res.metadata }, ts },
-        ])
+        setEvents(prev => [...prev, { event: 'meta', data: { id: res.id, created: res.created, model: res.model, provider: res.provider, status: res.status || 'completed', metadata: res.metadata }, ts }])
         if (res?.metadata?.thread_id) { setThreadId(res.metadata.thread_id); threadIdRef.current = res.metadata.thread_id }
         // capture provider request from backend metadata
         if (res?.metadata?.provider_request) setLastProviderRequest(res.metadata.provider_request)
@@ -141,18 +151,21 @@ export default function App() {
   }
 
   return (
-    <div className="max-w-6xl mx-auto p-4 space-y-6">
-      <div className="flex items-start justify-between">
+    <div className="max-w-7xl mx-auto p-4 space-y-6">
+      <div className="flex items-start justify-between flex-wrap gap-4">
         <h1 className="text-2xl font-bold">Local Responses Hub</h1>
-        <div className="flex gap-2">
-          <button className={`px-2 py-1 border rounded ${tab==='chat'?'bg-gray-200':''}`} onClick={()=>setTab('chat')}>Chat</button>
-          <button className={`px-2 py-1 border rounded ${tab==='profile'?'bg-gray-200':''}`} onClick={()=>setTab('profile')}>Profile</button>
-          <button className={`px-2 py-1 border rounded ${tab==='output'?'bg-gray-200':''}`} onClick={()=>setTab('output')}>Output</button>
+        <div className="flex flex-wrap gap-2">
+          {(['chat','profile','output','l1','l2','l3'] as const).map(t => (
+            <button key={t} className={`px-2 py-1 border rounded ${tab===t?'bg-gray-200':''}`} onClick={()=>setTab(t.toLowerCase() as any)}>
+              {t === 'l1' ? 'L1' : t === 'l2' ? 'L2' : t === 'l3' ? 'L3' : t.charAt(0).toUpperCase()+t.slice(1)}
+            </button>
+          ))}
+          <button className="px-2 py-1 border rounded disabled:opacity-50" disabled={!threadIdRef.current} onClick={fetchMemory}>⟳ Memory</button>
         </div>
         <StatusIndicators />
       </div>
 
-      {tab === 'chat' ? (
+      {tab === 'chat' && (
         <>
           <Controls
             model={model} setModel={setModel}
@@ -188,15 +201,55 @@ export default function App() {
             <MessageView items={history?.messages || []} />
           </div>
         </>
-      ) : tab === 'profile' ? (
-        <ProfilePage />
-      ) : (
+      )}
+      {tab === 'profile' && <ProfilePage />}
+      {tab === 'output' && (
         <div>
           <h2 className="font-semibold mb-2">Последний запрос бэка → LM Studio (JSON)</h2>
-          <div className="mb-2 flex items-center gap-2">
-            <button className="px-2 py-1 border rounded disabled:opacity-50" onClick={copyLastProviderRequest} disabled={!lastProviderRequest}>Копировать</button>
+            <div className="mb-2 flex items-center gap-2">
+              <button className="px-2 py-1 border rounded disabled:opacity-50" onClick={copyLastProviderRequest} disabled={!lastProviderRequest}>Копировать</button>
+            </div>
+            <pre className="p-3 border rounded bg-white overflow-auto whitespace-pre-wrap">{lastProviderRequest ? JSON.stringify(lastProviderRequest, null, 2) : 'Еще нет данных. Отправьте запрос.'}</pre>
+        </div>
+      )}
+      {tab === 'l1' && (
+        <div>
+          <h2 className="font-semibold mb-2">Memory L1 (pairs oldest → newest)</h2>
+          <div className="space-y-2">
+            {memory?.l1_pairs?.map((p,i)=>(
+              <div key={i} className="border rounded p-2 bg-white">
+                <div className="text-[11px] text-gray-500">{p.u_id} → {p.a_id}</div>
+                <div className="mt-1"><b>User:</b> {p.u_text}</div>
+                <div className="mt-1"><b>Assistant:</b> {p.a_text}</div>
+              </div>
+            )) || <div className="text-gray-400">—</div>}
           </div>
-          <pre className="p-3 border rounded bg-white overflow-auto whitespace-pre-wrap">{lastProviderRequest ? JSON.stringify(lastProviderRequest, null, 2) : 'Еще нет данных. Отправьте запрос.'}</pre>
+        </div>
+      )}
+      {tab === 'l2' && (
+        <div>
+          <h2 className="font-semibold mb-2">Memory L2 (summaries)</h2>
+          <div className="space-y-2">
+            {memory?.l2?.map(r=> (
+              <div key={r.id} className="border rounded p-2 bg-white">
+                <div className="text-[11px] text-gray-500">#{r.id} {r.u}→{r.a} • tok:{r.tokens}</div>
+                <div className="whitespace-pre-wrap text-sm">{r.text}</div>
+              </div>
+            )) || <div className="text-gray-400">—</div>}
+          </div>
+        </div>
+      )}
+      {tab === 'l3' && (
+        <div>
+          <h2 className="font-semibold mb-2">Memory L3 (micro summaries)</h2>
+          <div className="space-y-2">
+            {memory?.l3?.map(r=> (
+              <div key={r.id} className="border rounded p-2 bg-white">
+                <div className="text-[11px] text-gray-500">#{r.id} L2:{r.start_l2_id}→{r.end_l2_id} • tok:{r.tokens}</div>
+                <div className="whitespace-pre-wrap text-sm">{r.text}</div>
+              </div>
+            )) || <div className="text-gray-400">—</div>}
+          </div>
         </div>
       )}
     </div>

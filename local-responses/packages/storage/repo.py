@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from packages.core.settings import get_settings
 from packages.storage.models import Base, Message, Response, Thread, Profile, MemoryState, L2Summary, L3MicroSummary, ToolRun
 from packages.utils.tokens import approx_tokens
-from packages.orchestration.redactor import redact_fragment
+from packages.orchestration.redactor import redact_fragment, sanitize_for_memory
 
 
 settings = get_settings()
@@ -329,7 +329,6 @@ async def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang
     from packages.orchestration.redactor import sanitize_for_memory
 
     created = 0
-    # Collect payloads first (texts) inside one session (without summarizing inside the session)
     need: List[Tuple[str,str,str,str]] = []  # (u_id,a_id,u_txt,a_txt)
     with session_scope() as s:
         for (uid, aid) in pairs:
@@ -370,38 +369,69 @@ async def ensure_l2_for_pairs(thread_id: str, pairs: List[Tuple[str, str]], lang
             created += 1
     return created
 
-async def promote_l2_to_l3(thread_id: str, l2_ids: List[int], lang: str, now: int) -> int:
-    if not l2_ids:
-        return 0
+async def ensure_l2_for_pairs_grouped(thread_id: str,
+                                      pairs_seq: List[Tuple[str, str]],
+                                      lang: str,
+                                      now_ts: int,
+                                      group_size: int,
+                                      max_group_tokens: int | None = None) -> dict:
+    """HF-32C: Group consecutive user→assistant pairs (ASC) into L2 summaries.
+    Creates ONE L2 record per group of size group_size.
+    Returns {"groups": N, "pairs": M}.
+    Does not deduplicate existing coverage ranges; assumes upstream filtered fresh pairs.
+    """
+    if not pairs_seq:
+        return {"groups": 0, "pairs": 0}
     from packages.orchestration import summarizer
 
-    # Load items + texts first
-    with session_scope() as s:
-        items = list(s.query(L2Summary).filter(
-            L2Summary.thread_id == thread_id,
-            L2Summary.id.in_(l2_ids)
-        ).order_by(L2Summary.id.asc()))
-    if not items:
-        return 0
-    texts = [x.text or "" for x in items]
-    try:
-        l3_text = await summarizer.summarize_l2_block_to_l3(texts, lang or "ru")
-    except Exception:
-        # fallback – join first lines
-        bullets = [f"• {(t.splitlines() or [''])[0][:160]}" for t in texts[:2]]
-        l3_text = "\n".join(bullets)
-    with session_scope() as s:
-        # re-fetch to ensure they still exist; adjust if some disappeared
-        current = list(s.query(L2Summary).filter(L2Summary.thread_id == thread_id, L2Summary.id.in_([x.id for x in items])).order_by(L2Summary.id.asc()))
-        if not current:
-            return 0
-        start_id = current[0].id
-        end_id = current[-1].id
-        rec = L3MicroSummary(thread_id=thread_id, start_l2_id=start_id, end_l2_id=end_id, text=l3_text, tokens=approx_tokens(l3_text), created_at=now)
-        s.add(rec)
-        for x in current:
-            s.delete(x)
-    return 1
+    if group_size <= 0:
+        group_size = 1
+    created_groups = 0
+    created_pairs = 0
+    i = 0
+    while i < len(pairs_seq):
+        chunk = pairs_seq[i:i+group_size]
+        if not chunk:
+            break
+        # Load texts for chunk
+        pairs_texts: List[Tuple[str,str]] = []
+        with session_scope() as s:
+            for (uid, aid) in chunk:
+                um = s.get(Message, uid); am = s.get(Message, aid)
+                if not um or not am:
+                    continue
+                pairs_texts.append((sanitize_for_memory(um.content or ''), sanitize_for_memory(am.content or '')))
+        if not pairs_texts:
+            i += group_size
+            continue
+        try:
+            l2_text = await summarizer.summarize_pairs_group_to_l2(
+                chunk,
+                pairs_texts,
+                lang=lang or 'ru',
+                max_tokens=max_group_tokens or (settings.L2_GROUP_MAX_TOKENS if getattr(settings, 'L2_GROUP_MAX_TOKENS', 0) else None)
+            )
+        except Exception:
+            # Fallback: join first lines
+            lines = []
+            for (u_txt, a_txt) in pairs_texts[:2]:
+                u_short = (u_txt.splitlines() or [''])[0][:160]
+                a_short = (a_txt.splitlines() or [''])[0][:160]
+                lines.append(f"- {u_short} → {a_short}")
+            l2_text = "\n".join(lines) if lines else "(empty)"
+        first_u, _ = chunk[0]; _, last_a = chunk[-1]
+        rec = L2Summary(thread_id=thread_id,
+                        start_message_id=first_u,
+                        end_message_id=last_a,
+                        text=l2_text,
+                        tokens=approx_tokens(l2_text),
+                        created_at=now_ts)
+        with session_scope() as s:
+            s.add(rec)
+        created_groups += 1
+        created_pairs += len(chunk)
+        i += group_size
+    return {"groups": created_groups, "pairs": created_pairs}
 
 # Sync wrappers (if needed by legacy sync code)
 

@@ -1,5 +1,4 @@
-# apps/api/main.py (only relevant diffs applied earlier)
-
+# apps/api/main.py (excerpt with modifications for HF-33 integration)
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +12,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 from uuid import uuid4
-from urllib.parse import urlparse
 import uuid
 
 import httpx
@@ -30,10 +28,8 @@ from packages.providers.lmstudio import get_lmstudio_provider
 from packages.providers.lmstudio_model_info import fetch_model_info
 from packages.providers import lmstudio_tokens
 from packages.orchestration.redactor import redact_fragment, safe_profile_output
-from packages.orchestration.context_manager import build_context
 from packages.orchestration.context_builder import assemble_context
 from packages.orchestration.summarizer import try_autosummarize
-from packages.orchestration.budget import compute_budgets
 from packages.storage.repo import (
     append_message,
     create_thread,
@@ -43,30 +39,14 @@ from packages.storage.repo import (
     get_profile as repo_get_profile,
     save_profile as repo_save_profile,
     get_thread_messages_for_l1,
+    get_l2_for_thread,
+    get_l3_for_thread,
 )
 from packages.storage.models import Message, Thread
 from packages.utils.tokens import approx_tokens, profile_text_view, approx_tokens_messages
 from packages.orchestration.memory_manager import update_memory
-from packages.orchestration.tool_runtime import ToolRuntime
 from packages.orchestration.stream_handlers import ToolCallAssembler
-from packages.orchestration.retry_policy import make_retry_suffix, should_retry_length
 from packages.orchestration.after_reply import normalize_after_reply
-from packages.core import settings as ST  # optional module alias for limits
-
-# Prometheus metrics (simple counters)
-try:
-    from prometheus_client import Counter
-    LR_CTX_OVERFLOW = Counter('lr_context_overflow_prevented_total', 'Context squeezes occurred')
-    LR_CTX_TOKENS = Counter('lr_context_tokens_total', 'Context tokens total by part', ['part'])
-    LR_CTX_SQUEEZES = Counter('lr_context_squeezes_total', 'Squeeze actions total', ['type'])
-    LR_SUMMARY_CREATED = Counter('lr_summary_created_total', 'Summaries created by compaction', ['level'])
-    LR_COMPACTION_STEPS = Counter('lr_compaction_steps_total', 'Compaction steps', ['type'])
-except Exception:  # fallback dummies
-    class _Dummy:
-        def labels(self, *a, **k): return self
-        def inc(self, *a, **k): pass
-    LR_CTX_OVERFLOW = _Dummy(); LR_CTX_TOKENS = _Dummy(); LR_CTX_SQUEEZES = _Dummy()
-    LR_SUMMARY_CREATED = _Dummy(); LR_COMPACTION_STEPS = _Dummy()
 
 settings = get_settings()
 configure_logging(level=settings.log_level)
@@ -192,42 +172,6 @@ async def put_profile(payload: ProfileIn) -> JSONResponse:
     core_cap = int(math.ceil(core_tokens * 1.10))
     out = safe_profile_output(out) | {"core_tokens": core_tokens, "core_cap": core_cap}
     return JSONResponse(content=out)
-
-
-class ResponsesRequest(BaseModel):
-    model: str
-    input: str
-    system: Optional[str] = None
-    temperature: float = 0.7
-    max_output_tokens: int = 512
-    metadata: Optional[Dict[str, Any]] = None
-
-    thread_id: Optional[str] = None
-    create_thread: bool = False
-
-
-class ResponsesOutputItem(BaseModel):
-    type: Literal["message"] = "message"
-    role: Literal["assistant"] = "assistant"
-    content: list[Dict[str, Any]]
-
-
-class ResponsesUsage(BaseModel):
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-
-
-class ResponsesResponse(BaseModel):
-    id: str
-    object: Literal["response"] = "response"
-    created: int
-    model: str
-    status: Literal["completed", "failed"]
-    output: list[ResponsesOutputItem]
-    usage: ResponsesUsage
-    provider: Dict[str, Any]
-    metadata: Optional[Dict[str, Any]] = None
 
 
 @app.get("/health")
@@ -431,6 +375,66 @@ async def get_thread_messages(thread_id: str) -> JSONResponse:
         "context": ctx,
     })
 
+@app.get("/threads/{thread_id}/memory")
+async def get_thread_memory(thread_id: str) -> JSONResponse:
+    # Ensure thread exists
+    with session_scope() as s:
+        t = s.get(Thread, thread_id)
+        if not t:
+            raise HTTPException(status_code=404, detail="thread not found")
+    # Helper to normalize created_at (can be datetime or int epoch or None)
+    def _norm_created(v):
+        if v is None:
+            return None
+        try:
+            # datetime instance
+            if hasattr(v, 'isoformat'):
+                return v.isoformat()
+            # int/float epoch
+            if isinstance(v, (int, float)):
+                return datetime.fromtimestamp(v, timezone.utc).isoformat()
+            return str(v)
+        except Exception:
+            return None
+    # Build L1 pairs (oldest -> newest)
+    msgs = get_thread_messages_for_l1(thread_id, exclude_message_id=None, max_items=2000)
+    l1_pairs = []
+    last_u = None
+    for m in msgs:  # ASC
+        if m.role == 'user':
+            last_u = m
+        elif m.role == 'assistant' and last_u is not None:
+            l1_pairs.append({
+                'u_id': last_u.id,
+                'u_text': last_u.content,
+                'a_id': m.id,
+                'a_text': m.content,
+            })
+            last_u = None
+    l2_records = get_l2_for_thread(thread_id, limit=500)
+    l3_records = get_l3_for_thread(thread_id, limit=200)
+    data = {
+        'thread_id': thread_id,
+        'l1_pairs': l1_pairs,
+        'l2': [{
+            'id': r.id,
+            'u': r.start_message_id,
+            'a': r.end_message_id,
+            'text': r.text,
+            'tokens': r.tokens,
+            'created_at': _norm_created(getattr(r, 'created_at', None)),
+        } for r in l2_records],
+        'l3': [{
+            'id': r.id,
+            'start_l2_id': r.start_l2_id,
+            'end_l2_id': r.end_l2_id,
+            'text': r.text,
+            'tokens': r.tokens,
+            'created_at': _norm_created(getattr(r, 'created_at', None)),
+        } for r in l3_records],
+    }
+    return JSONResponse(content=data)
+
 async def _sse_format(event: str, data: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -451,16 +455,51 @@ class TokenizeReq(BaseModel):
     messages: Optional[list[dict]] = None
     text: Optional[str] = None
 
+# === RESTORED Pydantic models for /responses (were removed inadvertently causing HTTP 422) ===
+class ResponsesRequest(BaseModel):
+    model: str
+    input: str
+    system: Optional[str] = None
+    temperature: float = 0.7
+    max_output_tokens: int = 512
+    metadata: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None
+    create_thread: bool = False
+
+class ResponsesOutputItem(BaseModel):
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    content: list[Dict[str, Any]]
+
+class ResponsesUsage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+class ResponsesResponse(BaseModel):
+    id: str
+    object: Literal["response"] = "response"
+    created: int
+    model: str
+    status: Literal["completed", "failed"]
+    output: list[ResponsesOutputItem]
+    usage: ResponsesUsage
+    provider: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None
 
 @app.post("/providers/lmstudio/tokenize")
 async def tokenize(req: TokenizeReq):
     if settings.TOKEN_COUNT_MODE != "proxy":
         return {"error": "TOKEN_COUNT_MODE is not 'proxy'"}
     if req.messages:
-        n = lmstudio_tokens.count_tokens_chat(req.model, req.messages, settings.TOKEN_CACHE_TTL_SEC)
-        return {"mode": "chat", "prompt_tokens": n}
+        try:
+            n, mode = lmstudio_tokens.count_tokens_chat(req.model, req.messages)
+        except Exception:
+            n = approx_tokens_messages(req.messages)
+            mode = "approx"
+        return {"mode": mode, "prompt_tokens": n}
     if req.text is not None:
-        n = lmstudio_tokens.count_tokens_text(req.model, req.text, settings.TOKEN_CACHE_TTL_SEC)
+        n = lmstudio_tokens.count_tokens_text(req.model, req.text)
         return {"mode": "text", "prompt_tokens": n}
     return {"error": "provide messages or text"}
 
@@ -502,43 +541,31 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
     system_text = assembled["system_text"]
     messages_for_provider = assembled.get("provider_messages") or ([{"role": "system", "content": system_text}] + assembled["messages"] + [{"role": "user", "content": req.input}])
 
-    # Preflight tokens with silence protection
+    # Preflight tokens with compactor-aware free_out_cap
     try:
-        prompt_tok = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider, settings.TOKEN_CACHE_TTL_SEC)
-        token_mode = "proxy"
+        prompt_tok_tuple = lmstudio_tokens.count_tokens_chat(provider_model, messages_for_provider)
+        if isinstance(prompt_tok_tuple, tuple):
+            prompt_tok, token_mode = prompt_tok_tuple
+        else:
+            prompt_tok, token_mode = int(prompt_tok_tuple), "proxy-http"
     except Exception:
         prompt_tok = approx_tokens_messages(messages_for_provider)
         token_mode = "approx"
-    C_eff = int(assembled["context_budget"].get("C_eff") or 0)
-    R_sys = int(assembled["context_budget"].get("R_sys") or 0)
-    Safety = int(assembled["context_budget"].get("Safety") or 0)
-    free_out = max(0, C_eff - int(prompt_tok) - R_sys - Safety)
-    requested_mt = req.max_output_tokens or int(assembled["context_budget"].get("effective_max_output_tokens") or 0) or getattr(settings, 'CTX_ROUT_DEFAULT', 512)
-    eff_out = int(min(requested_mt, free_out))
-    assembled["context_budget"]["effective_max_output_tokens"] = eff_out
+
+    context_budget = assembled["context_budget"]
+    stats = assembled.get("stats", {})
+    C_eff = int(context_budget.get("C_eff") or 0)
+    R_sys = int(context_budget.get("R_sys") or 0)
+    Safety = int(context_budget.get("Safety") or 0)
+    free_out_cap = int(stats.get("free_out_cap") if stats.get("free_out_cap") is not None else max(0, C_eff - int(prompt_tok) - R_sys - Safety))
+    requested = req.max_output_tokens or settings.R_OUT_MIN
+    effective = max(settings.R_OUT_FLOOR, min(requested, free_out_cap))
+    context_budget["effective_max_output_tokens"] = effective
 
     # metadata base
-    metadata = {"context_budget": assembled.get("context_budget"), "context_assembly": assembled.get("stats", {})}
-    metadata["context_assembly"]["l1_pairs_count"] = assembled.get("stats", {}).get("l1_pairs_count", 0)
-    if 'includes' in assembled.get('stats', {}):
-        metadata["context_assembly"]["includes"] = assembled['stats']['includes']
-    # summary counters (parsed from compaction_steps)
-    steps_list = metadata["context_assembly"].get("compaction_steps", []) or []
-    sc = {"l1_to_l2": 0, "l2_to_l3": 0}
-    for _st in steps_list:
-        if _st.startswith("l1_to_l2:"):
-            try:
-                sc["l1_to_l2"] += int(_st.split(":",1)[1])
-            except Exception:
-                pass
-        elif _st.startswith("l2_to_l3:"):
-            try:
-                sc["l2_to_l3"] += int(_st.split(":",1)[1])
-            except Exception:
-                pass
-    metadata["context_assembly"]["summary_counters"] = sc
-    if 'l1_order_preview' in assembled.get('stats', {}):
-        metadata['context_assembly']['l1_order_preview'] = assembled['stats']['l1_order_preview']
+    metadata = {"context_budget": context_budget, "context_assembly": stats}
+    metadata["context_assembly"]["token_count_mode"] = token_mode
+    metadata["context_assembly"]["prompt_tokens_precise"] = int(prompt_tok)
 
     provider_request = {
         "url": f"{provider_info['base_url'].rstrip('/')}/v1/chat/completions",
@@ -546,7 +573,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             "model": provider_model,
             "messages": messages_for_provider,
             "temperature": req.temperature,
-            "max_tokens": eff_out,
+            "max_tokens": effective,
             **({"stream": True} if stream else {}),
         },
     }
@@ -560,7 +587,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                 user="",
                 model=provider_model,
                 temperature=req.temperature,
-                max_tokens=eff_out,
+                max_tokens=effective,
                 messages=messages_for_provider,
             )
             tool_calls = []
@@ -655,7 +682,8 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
         except Exception:
             pass
         try:
-            await try_autosummarize(thread_id, ctx.get("messages", []) + [{"role": "user", "content": req.input}, {"role": "assistant", "content": text}])
+            # Replace undefined 'ctx' reference with direct constructed messages list
+            await try_autosummarize(thread_id, [{"role": "user", "content": req.input}, {"role": "assistant", "content": text}])
             summary_reason = "scheduled"
         except Exception:
             summary_reason = "error"
@@ -707,7 +735,7 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
                     user="",
                     model=provider_model,
                     temperature=req.temperature,
-                    max_tokens=eff_out,
+                    max_tokens=effective,
                     messages=messages_for_provider,
                 ):
                     if cancel_flag["cancelled"]:
@@ -769,7 +797,6 @@ async def create_response(request: Request, req: ResponsesRequest, stream: bool 
             cost = Decimal(((usage_vals.get("total_tokens", 0)) / 1000) * float(price_1k)).quantize(Decimal("0.000001"))
             response_json = json.dumps({"id": resp_id, "object": "response", "created": created, "model": provider_model, "status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": final_text}]}], "usage": usage_vals, "provider": provider_info, "metadata": {"thread_id": thread_id}}, ensure_ascii=False)
             save_response(resp_id=resp_id, thread_id=thread_id, request_json=json.dumps(req.model_dump(), ensure_ascii=False), response_json=response_json, status="cancelled" if cancel_flag["cancelled"] else "completed", model=provider_model, provider_name=provider_info["name"], provider_base_url=provider_info["base_url"], usage=usage_vals, cost=cost)
-            # ... existing memory + summary scheduling code remains ...
             try:
                 tool_results_tokens = 0
                 mem = await update_memory(thread_id, assembled.get("context_budget", {}), tool_results_tokens, int(time.time()))
